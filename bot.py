@@ -155,8 +155,24 @@ class Sheets:
     def __init__(self):
         gc = gspread.service_account_from_dict(CREDS)
         self.book = gc.open_by_key(SHEET_ID)
+        self._ensure_sheets()
         self._specs: list[dict] = []
         self._specs_at = datetime.min.replace(tzinfo=TZ)
+
+    HEADERS = {
+        "specs": ["name", "aliases", "ingredients", "method", "glass", "garnish", "pitch", "tags"],
+        "stoplist": ["item", "since", "who", "note"],
+        "needs": ["id", "type", "text", "who", "created", "closed_by", "closed_at", "msg_id"],
+    }
+
+    def _ensure_sheets(self):
+        """Создаёт недостающие листы с заголовками; существующие не трогает."""
+        existing = {w.title for w in self.book.worksheets()}
+        for name, hdr in self.HEADERS.items():
+            if name not in existing:
+                w = self.book.add_worksheet(title=name, rows=200, cols=len(hdr))
+                w.append_row(hdr)
+                log.info("created sheet %s", name)
 
     def ws(self, name):
         return self.book.worksheet(name)
