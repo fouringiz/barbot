@@ -27,7 +27,7 @@ log = logging.getLogger("barbot")
 # ---------------------------------------------------------------- config
 TZ = ZoneInfo("Asia/Baku")
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-GROUP_ID = int(os.environ["GROUP_ID"])
+GROUP_ID = int(os.environ.get("GROUP_ID", "0"))            # 0 = ещё не настроено, /id работает
 TOPIC_STOP = int(os.environ.get("TOPIC_STOP", "0")) or None    # 0 = General
 TOPIC_NEEDS = int(os.environ.get("TOPIC_NEEDS", "0")) or None
 SHEET_ID = os.environ["SHEET_ID"]
@@ -229,7 +229,10 @@ dp = Dispatcher()
 sh = Sheets()
 
 
-async def post(topic: int | None, text: str) -> Message:
+async def post(topic: int | None, text: str) -> Message | None:
+    if not GROUP_ID:
+        log.warning("GROUP_ID не задан — пост пропущен: %s", text[:60])
+        return None
     return await bot.send_message(GROUP_ID, text, message_thread_id=topic)
 
 
@@ -382,7 +385,8 @@ async def cmd_need(m: Message, command: CommandObject):
     nid = await run(sh.need_add, type_, text, who(m))
     rec = {"id": nid, "type": type_, "text": text, "who": who(m), "created": stamp()}
     msg = await post(TOPIC_NEEDS, need_line(rec))
-    await run(sh.need_set_msg, nid, msg.message_id)
+    if msg:
+        await run(sh.need_set_msg, nid, msg.message_id)
     if not in_topic(m, TOPIC_NEEDS):
         await m.reply(f"Заявка #{nid} ({type_}) принята, в «Заявках».")
 
@@ -445,8 +449,19 @@ async def on_error(event: ErrorEvent):
     log.exception("update failed: %s", event.exception)
     msg = event.update.message if event.update else None
     if msg:
+        e = event.exception
+        name = type(e).__name__
+        hint = {
+            "WorksheetNotFound": "нет листа с таким именем — проверь: specs / stoplist / needs, латиницей, без пробелов",
+            "SpreadsheetNotFound": "таблица не найдена — проверь SHEET_ID или доступ для client_email",
+            "APIError": "Google отказал — таблица не расшарена на client_email (Редактор) или не включён Sheets API",
+            "KeyError": "в листе нет нужного столбца — проверь заголовки первой строки",
+        }.get(name, "")
+        text = f"⚠️ {name}: {esc(str(e)[:200])}"
+        if hint:
+            text += f"\n💡 {hint}"
         try:
-            await msg.reply("⚠️ Ошибка на моей стороне (скорее всего Google Sheets). Попробуй ещё раз.")
+            await msg.reply(text)
         except Exception:
             pass
 
