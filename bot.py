@@ -128,8 +128,16 @@ EQUIP_KW = (
     "шейкер", "джиггер", "стрейнер", "мадлер", "весы", "лампа", "светильник", "кран", "смесител",
     "бойлер", "водонагрев", "вытяжк", "кондиционер", "колонк", "принтер", "термина", "стул", "стол",
 )
-TYPE_ORDER = ("поломка", "оборудование", "расходник")
-TYPE_ICON = {"поломка": "🔧", "оборудование": "📦", "расходник": "🧻"}
+BAR_KW = (
+    "кампари", "campari", "апероль", "aperol", "джин", "gin", "виски", "whisk", "бурбон", "ром ", "ром,", "rum",
+    "текил", "tequila", "мескал", "водк", "vodka", "коньяк", "cognac", "бренди", "чача", "вермут", "vermouth",
+    "ликер", "ликёр", "биттер", "ангостур", "пейшо", "абсент", "амаро", "фернет", "мараскино", "куантро",
+    "трипл", "шартрез", "сироп", "сок", "пюре", "лайм", "лимон", "апельсин", "грейпфрут", "мят", "базилик",
+    "тархун", "лед", "лёд", "тоник", "содов", "просекко", "шампанск", "вино", "пиво", "кола", "имбирн",
+    "кофе", "эспрессо", "сливки", "белок", "яйц", "сахар", "мед ", "мёд", "соль", "гарнир", "вишн", "олив",
+)
+TYPE_ORDER = ("поломка", "оборудование", "бар", "расходник")
+TYPE_ICON = {"поломка": "🔧", "оборудование": "📦", "бар": "🍾", "расходник": "🧻"}
 
 
 def classify(text: str) -> str:
@@ -138,16 +146,31 @@ def classify(text: str) -> str:
         return "поломка"
     if any(k in t for k in EQUIP_KW):
         return "оборудование"
+    if any(k in (t + " ") for k in BAR_KW):
+        return "бар"
     return "расходник"
+
+
+def short(d: str) -> str:
+    """02.10.2026 15:31 -> 02.10 15:31"""
+    return re.sub(r"\.\d{4} ", " ", str(d))
 
 
 def need_line(r: dict, closed: bool = False) -> str:
     t = r.get("type", "")
-    label = f"{TYPE_ICON.get(t, '•')} <b>{esc(t).upper()}</b>" if t == "поломка" else TYPE_ICON.get(t, "•")
-    body = f"#{r['id']} {label} — {esc(r['text'])}\n— {esc(r['who'])}, {esc(r['created'])}"
+    icon = TYPE_ICON.get(t, "•")
     if closed:
-        body = f"<s>#{r['id']} {TYPE_ICON.get(t, '•')} {esc(r['text'])}</s>\n✅ {esc(r['closed_by'])}, {esc(r['closed_at'])}"
-    return body
+        return (
+            f"✅ <b>Заявка #{r['id']}</b> закрыта\n"
+            f"<s>{esc(r['text'])}</s>\n"
+            f"👤 {esc(r['closed_by'])} · {short(r['closed_at'])}"
+        )
+    label = f"<b>{esc(t).upper()}</b>" if t == "поломка" else esc(t)
+    return (
+        f"{icon} <b>Заявка #{r['id']}</b> · {label}\n"
+        f"{esc(r['text'])}\n"
+        f"👤 {esc(r['who'])} · {short(r['created'])}"
+    )
 
 
 # ---------------------------------------------------------------- sheets
@@ -305,9 +328,16 @@ async def cmd_spec(m: Message, command: CommandObject):
     if not command.args:
         return await m.reply("Как: /spec негрони")
     specs = await run(sh.specs)
+    if not specs:
+        return await m.reply(
+            "В листе <b>specs</b> ни одной строки. Проверь: лист называется именно specs, "
+            "в первой строке заголовки name, aliases, ingredients…, потом /reload."
+        )
     s = find_spec(specs, command.args)
     if not s:
-        return await m.reply(f"Не нашёл «{esc(command.args)}». Проверь имя или добавь alias в таблицу.")
+        return await m.reply(
+            f"Не нашёл «{esc(command.args)}» среди {len(specs)} спеков. Проверь имя или добавь alias в таблицу."
+        )
     stop = [r["item"] for r in await run(sh.stoplist)]
     text = card(s)
     dead = [n for n in spec_names(s) if any(tok_match(st, n) for st in stop)]
@@ -360,7 +390,7 @@ async def stop_text() -> str:
     if not rows:
         return "✅ Стоп-лист пуст"
     return "⛔ <b>Стоп-лист</b>\n" + "\n".join(
-        f"• {esc(r['item'])} — с {esc(r['since'])} ({esc(r['who'])})" for r in rows
+        f"• {esc(r['item'])} <i>— с {short(r['since'])}, {esc(r['who'])}</i>" for r in rows
     )
 
 
@@ -418,7 +448,7 @@ async def cmd_needs(m: Message):
         if not group:
             continue
         out.append(f"\n{TYPE_ICON[t]} <b>{t}</b>")
-        out += [f"#{r['id']} {esc(r['text'])} — {esc(r['who'])}, {esc(r['created'])}" for r in group]
+        out += [f"#{r['id']} {esc(r['text'])} <i>— {esc(r['who'])}, {short(r['created'])}</i>" for r in group]
     out.append("\nЗакрыть: /done <номер>")
     await m.reply("\n".join(out))
 
@@ -455,7 +485,7 @@ async def job_needs_digest():
     stale = [r for r in rows if (d := parse_stamp(r.get("created", ""))) and d < cutoff]
     if not stale:
         return
-    lines = [f"#{r['id']} {TYPE_ICON.get(r['type'], '•')} {esc(r['text'])} — висит с {esc(r['created'])}" for r in stale]
+    lines = [f"#{r['id']} {TYPE_ICON.get(r['type'], '•')} {esc(r['text'])} — висит с {short(r['created'])}" for r in stale]
     await post(TOPIC_NEEDS, "📌 <b>Висит больше 3 дней</b>\n" + "\n".join(lines) + "\n\nЗакрыть: /done <номер>")
 
 
