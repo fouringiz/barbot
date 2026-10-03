@@ -1,6 +1,6 @@
 """
 Bar-bot: спеки / стоп-лист / заявки для группы с топиками.
-Данные — Google Sheets (3 листа: specs, stoplist, needs).
+Данные — Google Sheets (specs, stoplist, needs, state).
 """
 import asyncio
 import html
@@ -16,6 +16,7 @@ import gspread
 from aiogram import BaseMiddleware, Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject
 from aiogram.types import BotCommand, ErrorEvent, Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -187,6 +188,7 @@ class Sheets:
         "specs": ["name", "aliases", "ingredients", "method", "glass", "garnish", "pitch", "tags"],
         "stoplist": ["item", "since", "who", "note"],
         "needs": ["id", "type", "text", "who", "created", "closed_by", "closed_at", "msg_id"],
+        "state": ["key", "value"],
     }
 
     def _ensure_sheets(self):
@@ -234,11 +236,21 @@ class Sheets:
         self.ws("needs").append_row([nid, type_, text, who, stamp(), "", "", ""])
         return nid
 
-    def need_set_msg(self, nid: int, msg_id: int):
-        ws = self.ws("needs")
-        cell = ws.find(str(nid), in_column=1)
+    def summary_id(self) -> int | None:
+        key = f"needs:{GROUP_ID}:{TOPIC_NEEDS}"
+        for row in self.ws("state").get_all_records():
+            if row.get("key") == key:
+                return int(row["value"]) if row.get("value") else None
+        return None
+
+    def set_summary_id(self, message_id: int):
+        ws = self.ws("state")
+        key = f"needs:{GROUP_ID}:{TOPIC_NEEDS}"
+        cell = ws.find(key, in_column=1)
         if cell:
-            ws.update_cell(cell.row, 8, msg_id)
+            ws.update_cell(cell.row, 2, message_id)
+        else:
+            ws.append_row([key, message_id])
 
     def need_close(self, nid: int, who: str) -> dict | None:
         ws = self.ws("needs")
@@ -444,36 +456,88 @@ async def cmd_stop(m: Message, command: CommandObject):
         await m.reply("Готово, запостил в «Стоп-лист».")
 
 
+
 # --- needs
+needs_lock = asyncio.Lock()
+
+
+def needs_text(rows: list[dict], compact: bool = False) -> str:
+    rows = [r for r in rows if not str(r.get("closed_at", "")).strip()]
+    if not rows:
+        return "📋 <b>Открытые заявки</b>\n✅ Открытых заявок нет"
+    out = [f"📋 <b>Открытые заявки: {len(rows)}</b>"]
+    shown = 0
+    footer = "\n\nЗакрыть: /done 14"
+    for t in (*TYPE_ORDER, "другое"):
+        group = [r for r in rows if (r.get("type") == t if t != "другое" else r.get("type") not in TYPE_ORDER)]
+        if not group:
+            continue
+        out.append(f"\n{TYPE_ICON.get(t, '•')} <b>{t}</b>")
+        for r in group:
+            text = str(r.get("text", ""))
+            if compact and len(text) > 180:
+                text = text[:177] + "…"
+            line = f"#{esc(r['id'])} {esc(text)} <i>— {esc(str(r.get('who', ''))[:100])}, {esc(short(r.get('created', '')))}</i>"
+            # Conservative bound, including HTML markup and UTF-16 emoji units.
+            candidate = "\n".join(out + [line]) + footer
+            if compact and len(candidate.encode("utf-16-le")) // 2 > 3500:
+                return "\n".join(out) + f"\n…ещё {len(rows) - shown}. Полный список: /needs" + footer
+            out.append(line)
+            shown += 1
+    return "\n".join(out) + footer
+
+
+async def refresh_needs_summary():
+    if not GROUP_ID:
+        return
+    text = needs_text(await run(sh.needs), compact=True)
+    message_id = await run(sh.summary_id)
+    if message_id:
+        try:
+            await bot.edit_message_text(text, chat_id=GROUP_ID, message_id=message_id)
+            return
+        except TelegramBadRequest as e:
+            reason = str(e).lower()
+            if "message is not modified" in reason:
+                return
+            if "message to edit not found" not in reason:
+                raise
+    msg = await post(TOPIC_NEEDS, text)
+    if msg:
+        await run(sh.set_summary_id, msg.message_id)
+
+
 @dp.message(Command("need"))
 async def cmd_need(m: Message, command: CommandObject):
     text = (command.args or "").strip()
     if not text:
         return await m.reply("Как: /need туалетная бумага  /  /need нет горячей воды")
     type_ = classify(text)
-    nid = await run(sh.need_add, type_, text, who(m))
-    rec = {"id": nid, "type": type_, "text": text, "who": who(m), "created": stamp()}
-    msg = await post(TOPIC_NEEDS, need_line(rec))
-    if msg:
-        await run(sh.need_set_msg, nid, msg.message_id)
-    if not in_topic(m, TOPIC_NEEDS):
-        await m.reply(f"Заявка #{nid} ({type_}) принята, в «Заявках».")
+    async with needs_lock:
+        nid = await run(sh.need_add, type_, text, who(m))
+        await refresh_needs_summary()
+    await m.reply(f"Заявка #{nid} ({type_}) принята. Сводка в «Заявках» обновлена.")
 
 
 @dp.message(Command("needs"))
 async def cmd_needs(m: Message):
-    rows = [r for r in await run(sh.needs) if not str(r.get("closed_at", "")).strip()]
-    if not rows:
-        return await m.reply("✅ Открытых заявок нет")
-    out = ["📋 <b>Открытые заявки</b>"]
-    for t in TYPE_ORDER:
-        group = [r for r in rows if r.get("type") == t]
-        if not group:
-            continue
-        out.append(f"\n{TYPE_ICON[t]} <b>{t}</b>")
-        out += [f"#{r['id']} {esc(r['text'])} <i>— {esc(r['who'])}, {short(r['created'])}</i>" for r in group]
-    out.append("\nЗакрыть: /done <номер>")
-    await m.reply("\n".join(out))
+    rows = await run(sh.needs)
+    # One complete HTML block per request keeps even very long lists valid.
+    open_rows = [r for r in rows if not str(r.get("closed_at", "")).strip()]
+    if not open_rows:
+        return await m.reply(needs_text([]))
+    ordered = sorted(open_rows, key=lambda r: TYPE_ORDER.index(r.get("type")) if r.get("type") in TYPE_ORDER else len(TYPE_ORDER))
+    batch = []
+    for row in ordered:
+        copy = dict(row)
+        copy["text"] = str(copy.get("text", ""))[:350] + ("…" if len(str(copy.get("text", ""))) > 350 else "")
+        copy["who"] = str(copy.get("who", ""))[:100]
+        if batch and len(needs_text(batch + [copy]).encode("utf-16-le")) // 2 > 3800:
+            await m.reply(needs_text(batch))
+            batch = []
+        batch.append(copy)
+    if batch:
+        await m.reply(needs_text(batch))
 
 
 @dp.message(Command("done"))
@@ -481,7 +545,10 @@ async def cmd_done(m: Message, command: CommandObject):
     arg = (command.args or "").strip().lstrip("#")
     if not arg.isdigit():
         return await m.reply("Как: /done 14")
-    rec = await run(sh.need_close, int(arg), who(m))
+    async with needs_lock:
+        rec = await run(sh.need_close, int(arg), who(m))
+        if rec is not None:
+            await refresh_needs_summary()
     if rec is None:
         return await m.reply(f"Заявки #{arg} нет.")
     if rec["already"]:
@@ -509,7 +576,7 @@ async def job_needs_digest():
     if not stale:
         return
     lines = [f"#{r['id']} {TYPE_ICON.get(r['type'], '•')} {esc(r['text'])} — висит с {short(r['created'])}" for r in stale]
-    await post(TOPIC_NEEDS, "📌 <b>Висит больше 3 дней</b>\n" + "\n".join(lines) + "\n\nЗакрыть: /done <номер>")
+    await post(TOPIC_NEEDS, "📌 <b>Висит больше 3 дней</b>\n" + "\n".join(lines) + "\n\nЗакрыть: /done 14")
 
 
 # --- errors
@@ -550,6 +617,8 @@ async def main():
     sched.add_job(job_morning_stop, CronTrigger(hour=11, minute=0))
     sched.add_job(job_needs_digest, CronTrigger(day_of_week="mon", hour=11, minute=5))
     sched.start()
+    async with needs_lock:
+        await refresh_needs_summary()
     await bot.delete_webhook(drop_pending_updates=True)
     log.info("polling started")
     await dp.start_polling(bot)
