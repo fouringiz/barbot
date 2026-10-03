@@ -129,6 +129,12 @@ EQUIP_KW = (
     "холодильник", "морозил", "льдогенератор", "блендер", "кофемашин", "посудомо", "техник",
     "шейкер", "джиггер", "стрейнер", "мадлер", "весы", "лампа", "светильник", "кран", "смесител",
     "бойлер", "водонагрев", "вытяжк", "кондиционер", "колонк", "принтер", "термина", "стул", "стол",
+    "тостер", "миксер", "соковыжим", "соковыдав", "кофемол", "чайник", "термометр", "штопор",
+    "открываш", "барная ложка", "барную ложку", "барные ложки", "барный нож", "барный коврик",
+    "бокал", "рюмк", "стакан", "графин", "декантер", "питчер",
+    "toaster", "blender", "mixer", "juicer", "fridge", "refrigerator", "freezer", "ice maker",
+    "coffee machine", "coffee grinder", "kettle", "shaker", "jigger", "strainer", "muddler",
+    "corkscrew", "bottle opener", "bar spoon", "glassware", "wine glass", "wine glasses",
 )
 BAR_KW = (
     "кампари", "campari", "апероль", "aperol", "джин", "gin", "виски", "whisk", "бурбон", "ром ", "ром,", "rum",
@@ -137,6 +143,23 @@ BAR_KW = (
     "трипл", "шартрез", "сироп", "сок", "пюре", "лайм", "лимон", "апельсин", "грейпфрут", "мят", "базилик",
     "тархун", "лед", "лёд", "тоник", "содов", "просекко", "шампанск", "вино", "пиво", "кола", "имбирн",
     "кофе", "эспрессо", "сливки", "белок", "яйц", "сахар", "мед ", "мёд", "соль", "гарнир", "вишн", "олив",
+    "долин", "долэн", "лилле", "бенедиктин", "бенедектин", "куантро", "калуа", "бейлис",
+    "самбук", "писко", "скотч", "портвейн", "херес", "мадера", "кашаса", "граппа", "кальвадос",
+    "просеко", "просекк", "содовая", "кордиал", "оршад", "маракуй", "ананас", "кокос", "гренадин",
+    "клюкв", "персик", "малин", "клубник", "шоколад", "какао", "ваниль", "корица", "молоко",
+)
+# Whole words for additional English terms: e.g. "ice" must not match "office".
+BAR_EN_KW = (
+    "bitter", "bitters", "dolin", "lillet", "brandy", "bourbon", "scotch", "mezcal", "mescal",
+    "liqueur", "liquor", "angostura", "peychaud", "peychauds", "absinthe", "amaro", "fernet",
+    "maraschino", "cointreau", "triple sec", "chartreuse", "benedictine", "kahlua", "baileys",
+    "sambuca", "pisco", "cachaca", "grappa", "calvados", "port", "sherry", "madeira",
+    "prosecco", "prosseco", "proseco", "prossecco", "champagne", "sparkling wine", "wine", "beer",
+    "syrup", "juice", "puree", "cordial", "orgeat", "grenadine", "lime", "limes", "lemon", "lemons",
+    "orange", "oranges", "grapefruit", "mint", "basil", "tarragon", "ice", "tonic", "soda", "cola",
+    "ginger", "coffee", "espresso", "cream", "milk", "egg", "eggs", "sugar", "honey", "salt",
+    "garnish", "cherry", "cherries", "olive", "olives", "pineapple", "coconut", "passion fruit",
+    "cranberry", "peach", "raspberry", "strawberry", "chocolate", "cocoa", "vanilla", "cinnamon",
 )
 TYPE_ORDER = ("поломка", "оборудование", "бар", "расходник")
 TYPE_ICON = {"поломка": "🔧", "оборудование": "📦", "бар": "🍾", "расходник": "🧻"}
@@ -148,7 +171,9 @@ def classify(text: str) -> str:
         return "поломка"
     if any(k in t for k in EQUIP_KW):
         return "оборудование"
-    if any(k in (t + " ") for k in BAR_KW):
+    if any(k in (t + " ") for k in BAR_KW) or any(
+        re.search(r"(?<!\w)" + re.escape(k) + r"(?!\w)", t) for k in BAR_EN_KW
+    ):
         return "бар"
     return "расходник"
 
