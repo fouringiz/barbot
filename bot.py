@@ -283,38 +283,17 @@ def in_topic(m: Message, topic: int | None) -> bool:
     return tid == topic
 
 
-class MembersOnly(BaseMiddleware):
-    """Пускаем только сообщения из нашей группы и личку от её участников."""
-    ALLOWED = {"creator", "administrator", "member", "restricted"}
-
-    def __init__(self):
-        self._cache: dict[int, tuple[bool, datetime]] = {}
-
-    async def is_member(self, user_id: int) -> bool:
-        ok, at = self._cache.get(user_id, (False, datetime.min.replace(tzinfo=TZ)))
-        if now() - at < timedelta(minutes=10):
-            return ok
-        try:
-            cm = await bot.get_chat_member(GROUP_ID, user_id)
-            ok = cm.status in self.ALLOWED
-        except Exception as e:
-            log.warning("get_chat_member failed for %s: %s", user_id, e)
-            ok = False
-        self._cache[user_id] = (ok, now())
-        return ok
+class GroupOnly(BaseMiddleware):
+    """Работаем только внутри нашей группы. Личка и чужие чаты — молча мимо."""
 
     async def __call__(self, handler: Callable[[Message, dict], Awaitable[Any]], m: Message, data: dict):
-        if not GROUP_ID:                      # ещё не настроен — пускаем всё, чтобы работал /id
+        if not GROUP_ID or m.chat.id == GROUP_ID:   # GROUP_ID пуст = ещё настраиваем, нужен /id
             return await handler(m, data)
-        if m.chat.id == GROUP_ID:
-            return await handler(m, data)
-        if m.chat.type == "private" and m.from_user and await self.is_member(m.from_user.id):
-            return await handler(m, data)
-        log.info("dropped message from chat %s user %s", m.chat.id, m.from_user.id if m.from_user else None)
+        log.info("dropped message from chat %s", m.chat.id)
         return None
 
 
-dp.message.outer_middleware(MembersOnly())
+dp.message.outer_middleware(GroupOnly())
 
 
 def who(m: Message) -> str:
