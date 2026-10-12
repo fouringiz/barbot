@@ -1,6 +1,6 @@
 """
 Bar-bot: спеки / стоп-лист / заявки для группы с топиками.
-Данные — Google Sheets (specs, stoplist, needs, state).
+Данные — Google Sheets (3 листа: specs, stoplist, needs).
 """
 import asyncio
 import html
@@ -16,9 +16,9 @@ import gspread
 from aiogram import BaseMiddleware, Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject
-from aiogram.types import BotCommand, ErrorEvent, Message
+from aiogram import F
+from aiogram.types import BotCommand, BufferedInputFile, ErrorEvent, Message, ReactionTypeEmoji
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from rapidfuzz import fuzz, process
@@ -32,6 +32,8 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 GROUP_ID = int(os.environ.get("GROUP_ID", "0"))            # 0 = ещё не настроено, /id работает
 TOPIC_STOP = int(os.environ.get("TOPIC_STOP", "0")) or None    # 0 = General
 TOPIC_NEEDS = int(os.environ.get("TOPIC_NEEDS", "0")) or None
+TOPIC_SPENT = int(os.environ.get("TOPIC_SPENT", "0")) or None   # топик «Расходы»; 0 = модуль выключен
+CLOSE_HOUR, CLOSE_MIN = (int(x) for x in os.environ.get("CLOSE_TIME", "02:00").split(":"))  # конец бар-дня
 SHEET_ID = os.environ["SHEET_ID"]
 CREDS = json.loads(os.environ["GOOGLE_CREDS_JSON"])
 
@@ -129,12 +131,6 @@ EQUIP_KW = (
     "холодильник", "морозил", "льдогенератор", "блендер", "кофемашин", "посудомо", "техник",
     "шейкер", "джиггер", "стрейнер", "мадлер", "весы", "лампа", "светильник", "кран", "смесител",
     "бойлер", "водонагрев", "вытяжк", "кондиционер", "колонк", "принтер", "термина", "стул", "стол",
-    "тостер", "миксер", "соковыжим", "соковыдав", "кофемол", "чайник", "термометр", "штопор",
-    "открываш", "барная ложка", "барную ложку", "барные ложки", "барный нож", "барный коврик",
-    "бокал", "рюмк", "стакан", "графин", "декантер", "питчер",
-    "toaster", "blender", "mixer", "juicer", "fridge", "refrigerator", "freezer", "ice maker",
-    "coffee machine", "coffee grinder", "kettle", "shaker", "jigger", "strainer", "muddler",
-    "corkscrew", "bottle opener", "bar spoon", "glassware", "wine glass", "wine glasses",
 )
 BAR_KW = (
     "кампари", "campari", "апероль", "aperol", "джин", "gin", "виски", "whisk", "бурбон", "ром ", "ром,", "rum",
@@ -143,23 +139,6 @@ BAR_KW = (
     "трипл", "шартрез", "сироп", "сок", "пюре", "лайм", "лимон", "апельсин", "грейпфрут", "мят", "базилик",
     "тархун", "лед", "лёд", "тоник", "содов", "просекко", "шампанск", "вино", "пиво", "кола", "имбирн",
     "кофе", "эспрессо", "сливки", "белок", "яйц", "сахар", "мед ", "мёд", "соль", "гарнир", "вишн", "олив",
-    "долин", "долэн", "лилле", "бенедиктин", "бенедектин", "куантро", "калуа", "бейлис",
-    "самбук", "писко", "скотч", "портвейн", "херес", "мадера", "кашаса", "граппа", "кальвадос",
-    "просеко", "просекк", "содовая", "кордиал", "оршад", "маракуй", "ананас", "кокос", "гренадин",
-    "клюкв", "персик", "малин", "клубник", "шоколад", "какао", "ваниль", "корица", "молоко",
-)
-# Whole words for additional English terms: e.g. "ice" must not match "office".
-BAR_EN_KW = (
-    "bitter", "bitters", "dolin", "lillet", "brandy", "bourbon", "scotch", "mezcal", "mescal",
-    "liqueur", "liquor", "angostura", "peychaud", "peychauds", "absinthe", "amaro", "fernet",
-    "maraschino", "cointreau", "triple sec", "chartreuse", "benedictine", "kahlua", "baileys",
-    "sambuca", "pisco", "cachaca", "grappa", "calvados", "port", "sherry", "madeira",
-    "prosecco", "prosseco", "proseco", "prossecco", "champagne", "sparkling wine", "wine", "beer",
-    "syrup", "juice", "puree", "cordial", "orgeat", "grenadine", "lime", "limes", "lemon", "lemons",
-    "orange", "oranges", "grapefruit", "mint", "basil", "tarragon", "ice", "tonic", "soda", "cola",
-    "ginger", "coffee", "espresso", "cream", "milk", "egg", "eggs", "sugar", "honey", "salt",
-    "garnish", "cherry", "cherries", "olive", "olives", "pineapple", "coconut", "passion fruit",
-    "cranberry", "peach", "raspberry", "strawberry", "chocolate", "cocoa", "vanilla", "cinnamon",
 )
 TYPE_ORDER = ("поломка", "оборудование", "бар", "расходник")
 TYPE_ICON = {"поломка": "🔧", "оборудование": "📦", "бар": "🍾", "расходник": "🧻"}
@@ -171,9 +150,7 @@ def classify(text: str) -> str:
         return "поломка"
     if any(k in t for k in EQUIP_KW):
         return "оборудование"
-    if any(k in (t + " ") for k in BAR_KW) or any(
-        re.search(r"(?<!\w)" + re.escape(k) + r"(?!\w)", t) for k in BAR_EN_KW
-    ):
+    if any(k in (t + " ") for k in BAR_KW):
         return "бар"
     return "расходник"
 
@@ -213,7 +190,7 @@ class Sheets:
         "specs": ["name", "aliases", "ingredients", "method", "glass", "garnish", "pitch", "tags"],
         "stoplist": ["item", "since", "who", "note"],
         "needs": ["id", "type", "text", "who", "created", "closed_by", "closed_at", "msg_id"],
-        "state": ["key", "value"],
+        "expenses": ["id", "date", "who", "amount", "text", "category", "need_id", "photo", "msg_id", "deleted"],
     }
 
     def _ensure_sheets(self):
@@ -261,21 +238,11 @@ class Sheets:
         self.ws("needs").append_row([nid, type_, text, who, stamp(), "", "", ""])
         return nid
 
-    def summary_id(self) -> int | None:
-        key = f"needs:{GROUP_ID}:{TOPIC_NEEDS}"
-        for row in self.ws("state").get_all_records():
-            if row.get("key") == key:
-                return int(row["value"]) if row.get("value") else None
-        return None
-
-    def set_summary_id(self, message_id: int):
-        ws = self.ws("state")
-        key = f"needs:{GROUP_ID}:{TOPIC_NEEDS}"
-        cell = ws.find(key, in_column=1)
+    def need_set_msg(self, nid: int, msg_id: int):
+        ws = self.ws("needs")
+        cell = ws.find(str(nid), in_column=1)
         if cell:
-            ws.update_cell(cell.row, 2, message_id)
-        else:
-            ws.append_row([key, message_id])
+            ws.update_cell(cell.row, 8, msg_id)
 
     def need_close(self, nid: int, who: str) -> dict | None:
         ws = self.ws("needs")
@@ -293,6 +260,34 @@ class Sheets:
         ws.update_cell(cell.row, 7, rec["closed_at"])
         rec["already"] = False
         return rec
+
+
+    # --- expenses
+    EXP_COLS = ["id", "date", "who", "amount", "text", "category", "need_id", "photo", "msg_id", "deleted"]
+
+    def expenses(self) -> list[dict]:
+        return [r for r in self.ws("expenses").get_all_records() if str(r.get("id", "")).strip()]
+
+    def expense_add(self, who, amount, text, category, need_id="", photo="", msg_id="") -> int:
+        ids = [int(r["id"]) for r in self.expenses() if str(r["id"]).isdigit()]
+        eid = max(ids, default=0) + 1
+        self.ws("expenses").append_row([eid, stamp(), who, amount if amount is not None else "", text, category,
+                                        need_id, photo, msg_id, ""])
+        return eid
+
+    def expense_by_msg(self, msg_id: int) -> tuple[int, dict] | None:
+        ws = self.ws("expenses")
+        cell = ws.find(str(msg_id), in_column=9)
+        if not cell:
+            return None
+        row = ws.row_values(cell.row)
+        row += [""] * (len(self.EXP_COLS) - len(row))
+        return cell.row, dict(zip(self.EXP_COLS, row))
+
+    def expense_set(self, row_idx: int, **fields):
+        ws = self.ws("expenses")
+        for k, v in fields.items():
+            ws.update_cell(row_idx, self.EXP_COLS.index(k) + 1, v)
 
 
 async def run(fn, *args):
@@ -359,6 +354,11 @@ HELP = (
     "Одна заявка — одна вещь. Пиши количество и срочность в тексте. Тип ставлю сам:\n"
     "🔧 поломка · 📦 оборудование · 🍾 бар · 🧻 расходник\n"
     "По понедельникам напоминаю о заявках старше 3 дней.\n\n"
+    "<b>Расходы</b> — топик «Расходы», команды не нужны\n"
+    "Пиши «лаймы 12.50» или фото чека с подписью «47.80 bravo» — ставлю ✅ и записываю. "
+    "Без суммы спрошу — ответь числом. «#14» в тексте закроет заявку 14. "
+    "Ошибся — ответь ❌ на запись. /spent — итог сейчас; итог дня постится при закрытии, "
+    "недели — в понедельник, месяца — 1-го с CSV.\n\n"
     "<b>Если что-то не так</b>\n"
     "Не ответил — подожди 10 сек, я хожу в таблицу. «Не нашёл» на /spec — коктейля нет в карте, "
     "напиши в General. Ответил ⚠️ — скриншот Чингизу. /reload — после правок в таблице спеков."
@@ -481,88 +481,36 @@ async def cmd_stop(m: Message, command: CommandObject):
         await m.reply("Готово, запостил в «Стоп-лист».")
 
 
-
 # --- needs
-needs_lock = asyncio.Lock()
-
-
-def needs_text(rows: list[dict], compact: bool = False) -> str:
-    rows = [r for r in rows if not str(r.get("closed_at", "")).strip()]
-    if not rows:
-        return "📋 <b>Открытые заявки</b>\n✅ Открытых заявок нет"
-    out = [f"📋 <b>Открытые заявки: {len(rows)}</b>"]
-    shown = 0
-    footer = "\n\nЗакрыть: /done 14"
-    for t in (*TYPE_ORDER, "другое"):
-        group = [r for r in rows if (r.get("type") == t if t != "другое" else r.get("type") not in TYPE_ORDER)]
-        if not group:
-            continue
-        out.append(f"\n{TYPE_ICON.get(t, '•')} <b>{t}</b>")
-        for r in group:
-            text = str(r.get("text", ""))
-            if compact and len(text) > 180:
-                text = text[:177] + "…"
-            line = f"#{esc(r['id'])} {esc(text)} <i>— {esc(str(r.get('who', ''))[:100])}, {esc(short(r.get('created', '')))}</i>"
-            # Conservative bound, including HTML markup and UTF-16 emoji units.
-            candidate = "\n".join(out + [line]) + footer
-            if compact and len(candidate.encode("utf-16-le")) // 2 > 3500:
-                return "\n".join(out) + f"\n…ещё {len(rows) - shown}. Полный список: /needs" + footer
-            out.append(line)
-            shown += 1
-    return "\n".join(out) + footer
-
-
-async def refresh_needs_summary():
-    if not GROUP_ID:
-        return
-    text = needs_text(await run(sh.needs), compact=True)
-    message_id = await run(sh.summary_id)
-    if message_id:
-        try:
-            await bot.edit_message_text(text, chat_id=GROUP_ID, message_id=message_id)
-            return
-        except TelegramBadRequest as e:
-            reason = str(e).lower()
-            if "message is not modified" in reason:
-                return
-            if "message to edit not found" not in reason:
-                raise
-    msg = await post(TOPIC_NEEDS, text)
-    if msg:
-        await run(sh.set_summary_id, msg.message_id)
-
-
 @dp.message(Command("need"))
 async def cmd_need(m: Message, command: CommandObject):
     text = (command.args or "").strip()
     if not text:
         return await m.reply("Как: /need туалетная бумага  /  /need нет горячей воды")
     type_ = classify(text)
-    async with needs_lock:
-        nid = await run(sh.need_add, type_, text, who(m))
-        await refresh_needs_summary()
-    await m.reply(f"Заявка #{nid} ({type_}) принята. Сводка в «Заявках» обновлена.")
+    nid = await run(sh.need_add, type_, text, who(m))
+    rec = {"id": nid, "type": type_, "text": text, "who": who(m), "created": stamp()}
+    msg = await post(TOPIC_NEEDS, need_line(rec))
+    if msg:
+        await run(sh.need_set_msg, nid, msg.message_id)
+    if not in_topic(m, TOPIC_NEEDS):
+        await m.reply(f"Заявка #{nid} ({type_}) принята, в «Заявках».")
 
 
 @dp.message(Command("needs"))
 async def cmd_needs(m: Message):
-    rows = await run(sh.needs)
-    # One complete HTML block per request keeps even very long lists valid.
-    open_rows = [r for r in rows if not str(r.get("closed_at", "")).strip()]
-    if not open_rows:
-        return await m.reply(needs_text([]))
-    ordered = sorted(open_rows, key=lambda r: TYPE_ORDER.index(r.get("type")) if r.get("type") in TYPE_ORDER else len(TYPE_ORDER))
-    batch = []
-    for row in ordered:
-        copy = dict(row)
-        copy["text"] = str(copy.get("text", ""))[:350] + ("…" if len(str(copy.get("text", ""))) > 350 else "")
-        copy["who"] = str(copy.get("who", ""))[:100]
-        if batch and len(needs_text(batch + [copy]).encode("utf-16-le")) // 2 > 3800:
-            await m.reply(needs_text(batch))
-            batch = []
-        batch.append(copy)
-    if batch:
-        await m.reply(needs_text(batch))
+    rows = [r for r in await run(sh.needs) if not str(r.get("closed_at", "")).strip()]
+    if not rows:
+        return await m.reply("✅ Открытых заявок нет")
+    out = ["📋 <b>Открытые заявки</b>"]
+    for t in TYPE_ORDER:
+        group = [r for r in rows if r.get("type") == t]
+        if not group:
+            continue
+        out.append(f"\n{TYPE_ICON[t]} <b>{t}</b>")
+        out += [f"#{r['id']} {esc(r['text'])} <i>— {esc(r['who'])}, {short(r['created'])}</i>" for r in group]
+    out.append("\nЗакрыть: /done <номер>")
+    await m.reply("\n".join(out))
 
 
 @dp.message(Command("done"))
@@ -570,10 +518,7 @@ async def cmd_done(m: Message, command: CommandObject):
     arg = (command.args or "").strip().lstrip("#")
     if not arg.isdigit():
         return await m.reply("Как: /done 14")
-    async with needs_lock:
-        rec = await run(sh.need_close, int(arg), who(m))
-        if rec is not None:
-            await refresh_needs_summary()
+    rec = await run(sh.need_close, int(arg), who(m))
     if rec is None:
         return await m.reply(f"Заявки #{arg} нет.")
     if rec["already"]:
@@ -589,6 +534,263 @@ async def cmd_done(m: Message, command: CommandObject):
     await m.reply(f"✅ #{arg} закрыта.")
 
 
+# --- expenses («Расходы»)
+QTY_RE = re.compile(r"\b\d+(?:[.,]\d+)?\s*(кг|г|гр|шт|бут|л|мл|уп|пач|пак|кор|ящ|x|х)\b", re.I)
+CUR_RE = re.compile(r"(\d+(?:[.,]\d{1,2})?)\s*(₼|azn|man|манат\w*|м\b)", re.I)
+NUM_RE = re.compile(r"(?<![\d.,])(\d+(?:[.,]\d{1,2})?)(?![\d.,])")
+NEED_RE = re.compile(r"#(\d+)")
+CAT_MAP = {"поломка": "ремонт", "оборудование": "оборудование", "бар": "бар", "расходник": "хозяйка"}
+CAT_ICON = {"бар": "🍾", "хозяйка": "🧻", "ремонт": "🔧", "оборудование": "📦", "прочее": "•"}
+OTHER_KW = ("такси", "доставк", "курьер", "бензин", "парков", "связь", "интернет", "реклам", "печать")
+
+
+def parse_amount(text: str) -> float | None:
+    t = NEED_RE.sub(" ", text)
+    t = QTY_RE.sub(" ", t)
+    m = CUR_RE.search(t)
+    if m:
+        return float(m.group(1).replace(",", "."))
+    nums = NUM_RE.findall(t)
+    return float(nums[-1].replace(",", ".")) if nums else None
+
+
+def exp_category(text: str) -> str:
+    t = norm(text)
+    if any(k in t for k in OTHER_KW):
+        return "прочее"
+    return CAT_MAP.get(classify(text), "прочее")
+
+
+def msg_link(m: Message) -> str:
+    cid = str(m.chat.id).removeprefix("-100")
+    tid = m.message_thread_id if m.is_topic_message else None
+    return f"https://t.me/c/{cid}/{tid}/{m.message_id}" if tid else f"https://t.me/c/{cid}/{m.message_id}"
+
+
+async def react(m: Message, emoji: str):
+    try:
+        await bot.set_message_reaction(m.chat.id, m.message_id, reaction=[ReactionTypeEmoji(emoji=emoji)])
+    except Exception as e:
+        log.warning("reaction failed: %s", e)
+
+
+RU_DAYS = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
+RU_MONTHS = ["январь", "февраль", "март", "апрель", "май", "июнь", "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь"]
+
+
+def ru_day(dt: datetime) -> str:
+    return f"{RU_DAYS[dt.weekday()]} {dt.strftime('%d.%m')}"
+
+
+def fmt_money(x: float) -> str:
+    return f"{x:,.2f}".replace(",", " ").replace(".00", "") + " ₼"
+
+
+async def close_need_from_text(text: str, who_: str, eid: int) -> str:
+    """#14 в тексте → закрываем заявку, возвращаем need_id для строки расхода."""
+    nm = NEED_RE.search(text)
+    if not nm:
+        return ""
+    rec = await run(sh.need_close, int(nm.group(1)), who_)
+    if rec and not rec["already"] and rec.get("msg_id"):
+        try:
+            await bot.edit_message_text(need_line(rec, closed=True), chat_id=GROUP_ID, message_id=int(rec["msg_id"]))
+        except Exception:
+            pass
+    return nm.group(1)
+
+
+def is_spent_topic(m: Message) -> bool:
+    return bool(TOPIC_SPENT) and m.chat.id == GROUP_ID and m.is_topic_message and m.message_thread_id == TOPIC_SPENT
+
+
+def not_command(m: Message) -> bool:
+    return not (m.text or m.caption or "").startswith("/")
+
+
+@dp.message(F.func(is_spent_topic), F.reply_to_message, F.func(not_command))
+async def spent_reply(m: Message):
+    """Реплай на запись: сумма (дописать) или ❌ (удалить)."""
+    text = (m.text or m.caption or "").strip()
+    if m.reply_to_message.message_id == m.message_thread_id:   # не реплай, а обычное сообщение в топике
+        return await spent_new(m)
+    found = await run(sh.expense_by_msg, m.reply_to_message.message_id)
+    if not found:
+        return await spent_new(m)          # реплай на что-то чужое — считаем новой записью
+    row_idx, rec = found
+    if text in ("❌", "x", "х", "-", "удали", "удалить"):
+        await run(sh.expense_set, row_idx, deleted="да")
+        return await react(m, "👌")
+    amt = parse_amount(text)
+    if amt is None:
+        return await react(m, "❓")
+    await run(sh.expense_set, row_idx, amount=amt)
+    await react(m, "✅")
+    await react(m.reply_to_message, "✅")
+
+
+@dp.message(F.func(is_spent_topic), F.text | F.photo | F.document, F.func(not_command))
+async def spent_new(m: Message):
+    text = (m.text or m.caption or "").strip()
+    amt = parse_amount(text)
+    photo = msg_link(m) if (m.photo or m.document) else ""
+    if not text and not photo:
+        return
+    if not text:
+        text = "чек"
+    need_id = ""
+    eid = await run(sh.expense_add, who(m), amt, text, exp_category(text), "", photo, m.message_id)
+    if NEED_RE.search(text):
+        need_id = await close_need_from_text(text, who(m), eid)
+        if need_id:
+            found = await run(sh.expense_by_msg, m.message_id)
+            if found:
+                await run(sh.expense_set, found[0], need_id=need_id)
+    if amt is None:
+        await react(m, "❓")
+        await m.reply("Сумма? Ответь на это сообщение числом.")
+    else:
+        await react(m, "✅")
+
+
+@dp.edited_message(F.func(is_spent_topic))
+async def spent_edited(m: Message):
+    found = await run(sh.expense_by_msg, m.message_id)
+    if not found:
+        return
+    text = (m.text or m.caption or "").strip() or "чек"
+    amt = parse_amount(text)
+    await run(sh.expense_set, found[0], text=text, amount=amt if amt is not None else "", category=exp_category(text))
+    await react(m, "✅" if amt is not None else "❓")
+
+
+@dp.message(Command("del"))
+async def cmd_del(m: Message):
+    if not m.reply_to_message:
+        return await m.reply("Ответь /del на запись, которую убрать.")
+    found = await run(sh.expense_by_msg, m.reply_to_message.message_id)
+    if not found:
+        return await m.reply("Это не запись расхода.")
+    await run(sh.expense_set, found[0], deleted="да")
+    await react(m.reply_to_message, "👌")
+
+
+def _live(rows: list[dict]) -> list[dict]:
+    out = []
+    for r in rows:
+        if str(r.get("deleted", "")).strip():
+            continue
+        try:
+            r["_amt"] = float(str(r.get("amount", "")).replace(",", "."))
+        except ValueError:
+            continue
+        r["_dt"] = parse_stamp(r.get("date", ""))
+        if r["_dt"]:
+            out.append(r)
+    return out
+
+
+def _between(rows, a: datetime, b: datetime):
+    return [r for r in rows if a <= r["_dt"] < b]
+
+
+def _by_cat(rows) -> str:
+    tot: dict[str, float] = {}
+    for r in rows:
+        tot[r.get("category", "прочее")] = tot.get(r.get("category", "прочее"), 0) + r["_amt"]
+    return " · ".join(f"{CAT_ICON.get(c, '•')} {c} {fmt_money(v)}" for c, v in sorted(tot.items(), key=lambda x: -x[1]))
+
+
+def last_close(ref: datetime | None = None) -> datetime:
+    ref = ref or now()
+    c = ref.replace(hour=CLOSE_HOUR, minute=CLOSE_MIN, second=0, microsecond=0)
+    return c if c <= ref else c - timedelta(days=1)
+
+
+async def spent_summary(period: str) -> str:
+    rows = _live(await run(sh.expenses))
+    n = now()
+    if period == "day":
+        a, b = last_close(), n
+    elif period == "week":
+        a, b = n - timedelta(days=7), n
+    else:
+        a, b = n.replace(day=1, hour=0, minute=0, second=0, microsecond=0), n
+    sel = _between(rows, a, b)
+    total = sum(r["_amt"] for r in sel)
+    return f"{fmt_money(total)} · {len(sel)} зап." + (f"\n{_by_cat(sel)}" if sel else "")
+
+
+@dp.message(Command("spent"))
+async def cmd_spent(m: Message):
+    if not TOPIC_SPENT:
+        return await m.reply("Модуль расходов не настроен (TOPIC_SPENT).")
+    d, w, mo = await spent_summary("day"), await spent_summary("week"), await spent_summary("month")
+    await m.reply(f"💸 <b>Сегодня</b>: {d}\n\n<b>7 дней</b>: {w}\n\n<b>Месяц</b>: {mo}")
+
+
+async def job_daily_spent():
+    rows = _live(await run(sh.expenses))
+    n = now()
+    day = _between(rows, n - timedelta(days=1), n)
+    if not day:
+        return
+    month = _between(rows, n.replace(day=1, hour=0, minute=0, second=0, microsecond=0), n)
+    label = ru_day(n - timedelta(hours=CLOSE_HOUR + 1))
+    lines = [f"💸 <b>Итог дня · {label}</b>",
+             f"{fmt_money(sum(r['_amt'] for r in day))} · {len(day)} зап.", _by_cat(day), ""]
+    lines += [f"• {esc(r['text'])} — {fmt_money(r['_amt'])} <i>({esc(r['who'])})</i>" for r in day]
+    pending = [r for r in await run(sh.expenses) if not str(r.get("amount", "")).strip() and not str(r.get("deleted", "")).strip()]
+    if pending:
+        lines += ["", f"❓ Без суммы: {len(pending)} — ответьте числом на эти записи"]
+    lines += ["", f"За месяц: <b>{fmt_money(sum(r['_amt'] for r in month))}</b>"]
+    await post(TOPIC_SPENT, "\n".join(lines))
+
+
+async def job_weekly_spent():
+    rows = _live(await run(sh.expenses))
+    n = now()
+    week = _between(rows, n - timedelta(days=7), n)
+    prev = _between(rows, n - timedelta(days=14), n - timedelta(days=7))
+    if not week:
+        return
+    tw, tp = sum(r["_amt"] for r in week), sum(r["_amt"] for r in prev)
+    delta = f" ({'+' if tw >= tp else ''}{(tw - tp) / tp * 100:.0f}% к прошлой)" if tp else ""
+    days: dict[str, float] = {}
+    for r in week:
+        k = ru_day(r["_dt"])
+        days[k] = days.get(k, 0) + r["_amt"]
+    top = sorted(week, key=lambda r: -r["_amt"])[:5]
+    lines = [f"📊 <b>Неделя</b>: {fmt_money(tw)} · {len(week)} зап.{delta}", _by_cat(week), ""]
+    lines += [f"{k}: {fmt_money(v)}" for k, v in days.items()]
+    lines += ["", "<b>Крупные:</b>"] + [f"• {esc(r['text'])} — {fmt_money(r['_amt'])}" for r in top]
+    nophoto = [r for r in week if not str(r.get("photo", "")).strip() and r["_amt"] >= 20]
+    if nophoto:
+        lines += ["", f"📷 Без чека от 20 ₼: " + ", ".join(f"#{r['id']}" for r in nophoto)]
+    await post(TOPIC_SPENT, "\n".join(lines))
+
+
+async def job_monthly_spent():
+    rows = _live(await run(sh.expenses))
+    n = now()
+    first_this = n.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    first_prev = (first_this - timedelta(days=1)).replace(day=1)
+    month = _between(rows, first_prev, first_this)
+    if not month:
+        return
+    total = sum(r["_amt"] for r in month)
+    await post(TOPIC_SPENT, f"🗓 <b>{RU_MONTHS[first_prev.month - 1]} {first_prev.year}</b>: {fmt_money(total)} · {len(month)} зап.\n{_by_cat(month)}")
+    import csv as _csv, io
+    buf = io.StringIO()
+    w = _csv.writer(buf)
+    w.writerow(["date", "who", "amount", "text", "category", "need_id", "photo"])
+    for r in month:
+        w.writerow([r["date"], r["who"], r["_amt"], r["text"], r["category"], r.get("need_id", ""), r.get("photo", "")])
+    data = buf.getvalue().encode("utf-8-sig")
+    await bot.send_document(GROUP_ID, BufferedInputFile(data, f"expenses_{first_prev.strftime('%Y-%m')}.csv"),
+                            message_thread_id=TOPIC_SPENT, caption="CSV для бухгалтера")
+
+
 # --- scheduler jobs
 async def job_morning_stop():
     await post(TOPIC_STOP, "🕚 Утренняя сводка\n" + await stop_text())
@@ -601,7 +803,7 @@ async def job_needs_digest():
     if not stale:
         return
     lines = [f"#{r['id']} {TYPE_ICON.get(r['type'], '•')} {esc(r['text'])} — висит с {short(r['created'])}" for r in stale]
-    await post(TOPIC_NEEDS, "📌 <b>Висит больше 3 дней</b>\n" + "\n".join(lines) + "\n\nЗакрыть: /done 14")
+    await post(TOPIC_NEEDS, "📌 <b>Висит больше 3 дней</b>\n" + "\n".join(lines) + "\n\nЗакрыть: /done <номер>")
 
 
 # --- errors
@@ -636,14 +838,17 @@ async def main():
         BotCommand(command="need", description="заявка: расходник / техника / поломка"),
         BotCommand(command="needs", description="открытые заявки"),
         BotCommand(command="done", description="закрыть заявку по номеру"),
+        BotCommand(command="spent", description="расходы: сегодня / неделя / месяц"),
         BotCommand(command="help", description="справка"),
     ])
     sched = AsyncIOScheduler(timezone=TZ)
     sched.add_job(job_morning_stop, CronTrigger(hour=11, minute=0))
     sched.add_job(job_needs_digest, CronTrigger(day_of_week="mon", hour=11, minute=5))
+    if TOPIC_SPENT:
+        sched.add_job(job_daily_spent, CronTrigger(hour=CLOSE_HOUR, minute=CLOSE_MIN))
+        sched.add_job(job_weekly_spent, CronTrigger(day_of_week="mon", hour=11, minute=10))
+        sched.add_job(job_monthly_spent, CronTrigger(day=1, hour=11, minute=15))
     sched.start()
-    async with needs_lock:
-        await refresh_needs_summary()
     await bot.delete_webhook(drop_pending_updates=True)
     log.info("polling started")
     await dp.start_polling(bot)
