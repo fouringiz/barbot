@@ -290,9 +290,9 @@ class Sheets:
             ws.update_cell(row_idx, self.EXP_COLS.index(k) + 1, v)
 
 
-async def run(fn, *args):
+async def run(fn, *args, **kwargs):
     """gspread синхронный — уводим в тред, чтобы не блокировать бота."""
-    return await asyncio.to_thread(fn, *args)
+    return await asyncio.to_thread(fn, *args, **kwargs)
 
 
 # ---------------------------------------------------------------- bot
@@ -539,9 +539,12 @@ QTY_RE = re.compile(r"\b\d+(?:[.,]\d+)?\s*(кг|г|гр|шт|бут|л|мл|уп
 CUR_RE = re.compile(r"(\d+(?:[.,]\d{1,2})?)\s*(₼|azn|man|манат\w*|м\b)", re.I)
 NUM_RE = re.compile(r"(?<![\d.,])(\d+(?:[.,]\d{1,2})?)(?![\d.,])")
 NEED_RE = re.compile(r"#(\d+)")
-CAT_MAP = {"поломка": "ремонт", "оборудование": "оборудование", "бар": "бар", "расходник": "хозяйка"}
-CAT_ICON = {"бар": "🍾", "хозяйка": "🧻", "ремонт": "🔧", "оборудование": "📦", "прочее": "•"}
-OTHER_KW = ("такси", "доставк", "курьер", "бензин", "парков", "связь", "интернет", "реклам", "печать")
+HOUSE_KW = (
+    "бумаг", "мыло", "салфет", "пакет", "губк", "моющ", "перчат", "швабр", "тряпк", "фольг", "пленк", "плёнк",
+    "трубоч", "одноразов", "жидкост", "чистящ", "порош", "мешк", "зубочист", "свеч", "спичк", "зажигал",
+)
+OTHER_KW = ("такси", "доставк", "курьер", "бензин", "парков", "связь", "интернет", "реклам", "печать", "чаев")
+CAT_ICON = {"бар": "🍾", "расходники": "🧻", "ремонт": "🔧", "оборудование": "📦", "прочее": "•", "без описания": "❔"}
 
 
 def parse_amount(text: str) -> float | None:
@@ -556,9 +559,19 @@ def parse_amount(text: str) -> float | None:
 
 def exp_category(text: str) -> str:
     t = norm(text)
+    if not re.search(r"[a-zа-я]", t):
+        return "без описания"
+    if any(k in t for k in BREAK_KW):
+        return "ремонт"
+    if any(k in t for k in EQUIP_KW):
+        return "оборудование"
+    if any(k in (t + " ") for k in BAR_KW):
+        return "бар"
+    if any(k in t for k in HOUSE_KW):
+        return "расходники"
     if any(k in t for k in OTHER_KW):
         return "прочее"
-    return CAT_MAP.get(classify(text), "прочее")
+    return "прочее"
 
 
 def msg_link(m: Message) -> str:
@@ -743,6 +756,9 @@ async def job_daily_spent():
     pending = [r for r in await run(sh.expenses) if not str(r.get("amount", "")).strip() and not str(r.get("deleted", "")).strip()]
     if pending:
         lines += ["", f"❓ Без суммы: {len(pending)} — ответьте числом на эти записи"]
+    nodesc = [r for r in day if r.get("category") == "без описания"]
+    if nodesc:
+        lines += [f"❔ Без описания: {len(nodesc)} — отредактируйте, добавьте что куплено"]
     lines += ["", f"За месяц: <b>{fmt_money(sum(r['_amt'] for r in month))}</b>"]
     await post(TOPIC_SPENT, "\n".join(lines))
 
