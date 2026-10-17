@@ -509,7 +509,7 @@ async def cmd_needs(m: Message):
             continue
         out.append(f"\n{TYPE_ICON[t]} <b>{t}</b>")
         out += [f"#{r['id']} {esc(r['text'])} <i>— {esc(r['who'])}, {short(r['created'])}</i>" for r in group]
-    out.append("\nЗакрыть: /done <номер>")
+    out.append("\nЗакрыть: /done &lt;номер&gt;")
     await m.reply("\n".join(out))
 
 
@@ -613,6 +613,9 @@ async def close_need_from_text(text: str, who_: str, eid: int) -> str:
     return nm.group(1)
 
 
+PROMPTS: dict[int, int] = {}   # msg_id вопроса «Сумма?» -> msg_id записи (живёт до рестарта)
+
+
 def is_spent_topic(m: Message) -> bool:
     return bool(TOPIC_SPENT) and m.chat.id == GROUP_ID and m.is_topic_message and m.message_thread_id == TOPIC_SPENT
 
@@ -623,13 +626,18 @@ def not_command(m: Message) -> bool:
 
 @dp.message(F.func(is_spent_topic), F.reply_to_message, F.func(not_command))
 async def spent_reply(m: Message):
-    """Реплай на запись: сумма (дописать) или ❌ (удалить)."""
+    """Реплай на запись (или на вопрос «Сумма?»): сумма — дописать, ❌ — удалить."""
     text = (m.text or m.caption or "").strip()
-    if m.reply_to_message.message_id == m.message_thread_id:   # не реплай, а обычное сообщение в топике
+    target = m.reply_to_message
+    if target.message_id == m.message_thread_id:        # не реплай, а обычное сообщение в топике
         return await spent_new(m)
-    found = await run(sh.expense_by_msg, m.reply_to_message.message_id)
+    target_id = PROMPTS.get(target.message_id, target.message_id)
+    from_bot = target.from_user and target.from_user.id == bot.id
+    found = await run(sh.expense_by_msg, target_id)
     if not found:
-        return await spent_new(m)          # реплай на что-то чужое — считаем новой записью
+        if from_bot:                                     # ответ на сводку/вопрос бота — не запись
+            return await react(m, "🤷")
+        return await spent_new(m)                        # реплай на чьё-то обычное сообщение
     row_idx, rec = found
     if text in ("❌", "x", "х", "-", "удали", "удалить"):
         await run(sh.expense_set, row_idx, deleted="да")
@@ -639,7 +647,8 @@ async def spent_reply(m: Message):
         return await react(m, "❓")
     await run(sh.expense_set, row_idx, amount=amt)
     await react(m, "✅")
-    await react(m.reply_to_message, "✅")
+    if not from_bot:
+        await react(target, "✅")
 
 
 @dp.message(F.func(is_spent_topic), F.text | F.photo | F.document, F.func(not_command))
@@ -647,8 +656,8 @@ async def spent_new(m: Message):
     text = (m.text or m.caption or "").strip()
     amt = parse_amount(text)
     photo = msg_link(m) if (m.photo or m.document) else ""
-    if not text and not photo:
-        return
+    if not photo and (amt is None and not re.search(r"[a-zа-я]", text.lower())):
+        return                                            # ❌, эмодзи, пустое — не запись
     if not text:
         text = "чек"
     need_id = ""
@@ -661,7 +670,8 @@ async def spent_new(m: Message):
                 await run(sh.expense_set, found[0], need_id=need_id)
     if amt is None:
         await react(m, "❓")
-        await m.reply("Сумма? Ответь на это сообщение числом.")
+        q = await m.reply("Сумма? Ответь числом — на это сообщение или на запись.")
+        PROMPTS[q.message_id] = m.message_id
     else:
         await react(m, "✅")
 
@@ -819,7 +829,7 @@ async def job_needs_digest():
     if not stale:
         return
     lines = [f"#{r['id']} {TYPE_ICON.get(r['type'], '•')} {esc(r['text'])} — висит с {short(r['created'])}" for r in stale]
-    await post(TOPIC_NEEDS, "📌 <b>Висит больше 3 дней</b>\n" + "\n".join(lines) + "\n\nЗакрыть: /done <номер>")
+    await post(TOPIC_NEEDS, "📌 <b>Висит больше 3 дней</b>\n" + "\n".join(lines) + "\n\nЗакрыть: /done &lt;номер&gt;")
 
 
 # --- errors
