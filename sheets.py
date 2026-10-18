@@ -40,14 +40,32 @@ class Sheets:
                 log.info("created sheet %s", name)
         ws = self.ws("expenses")
         headers = ws.row_values(1)
-        if headers != self.EXP_COLS[:len(headers)] or len(headers) < 10:
-            raise ValueError("expenses: неожиданные заголовки; автоматическое обновление остановлено")
-        if len(headers) < len(self.EXP_COLS):
-            if ws.col_count < len(self.EXP_COLS):
-                ws.resize(cols=len(self.EXP_COLS))
+        self._validate_expense_headers(headers, require_metadata=False)
+        missing = [name for name in self.EXP_COLS[10:] if name not in headers]
+        if missing:
+            width = len(headers) + len(missing)
+            if ws.col_count < width:
+                ws.resize(cols=width)
             start = gspread.utils.rowcol_to_a1(1, len(headers) + 1)
-            end = gspread.utils.rowcol_to_a1(1, len(self.EXP_COLS))
-            ws.update(values=[self.EXP_COLS[len(headers):]], range_name=f"{start}:{end}")
+            end = gspread.utils.rowcol_to_a1(1, width)
+            ws.update(values=[missing], range_name=f"{start}:{end}")
+
+    def _validate_expense_headers(self, headers, require_metadata=True):
+        if headers[:10] != self.EXP_COLS[:10]:
+            raise ValueError("expenses: первые 10 заголовков должны быть " + ", ".join(self.EXP_COLS[:10])
+                             + "; получено: " + repr(headers[:10]))
+        for name in self.EXP_COLS[10:]:
+            if headers.count(name) > 1 or (require_metadata and name not in headers):
+                raise ValueError(f"expenses: нужна ровно одна служебная колонка {name!r}")
+
+    def _expense_headers(self, ws):
+        headers = ws.row_values(1)
+        self._validate_expense_headers(headers)
+        return headers
+
+    def _expense_record(self, headers, row):
+        return {name: row[i] if i < len(row) else ""
+                for i, name in enumerate(headers) if name in self.EXP_COLS}
 
     def ws(self, name):
         return self.book.worksheet(name)
@@ -111,8 +129,11 @@ class Sheets:
 
     # --- expenses
     def expenses(self) -> list[dict]:
-        return [r for r in self.ws("expenses").get_all_records(numericise_ignore=["all"])
-                if str(r.get("id", "")).strip()]
+        values = self.ws("expenses").get_all_values()
+        headers = values[0] if values else []
+        self._validate_expense_headers(headers)
+        rows = [self._expense_record(headers, row) for row in values[1:]]
+        return [r for r in rows if str(r["id"]).strip()]
 
     def expense_add(self, who, amount, text, category, need_id="", photo="", msg_id="") -> int:
         rec, _ = self.expense_add_once(who, amount, text, category, need_id, photo, msg_id)
@@ -135,31 +156,32 @@ class Sheets:
             values = [max(ids, default=0) + 1, stamp(), who, amount if amount is not None else "", text,
                       category, need_id, photo, msg_id, "", request_key, request_hash,
                       "pending" if request_key else "", "pending" if request_key and need_id else ""]
-            self.ws("expenses").append_row(values, value_input_option="RAW")
-            return dict(zip(self.EXP_COLS, values)), True
+            rec = dict(zip(self.EXP_COLS, values))
+            ws = self.ws("expenses")
+            headers = self._expense_headers(ws)
+            ws.append_row([rec.get(name, "") for name in headers], value_input_option="RAW")
+            return rec, True
 
     def expense_by_msg(self, msg_id: int) -> tuple[int, dict] | None:
-        ws = self.ws("expenses")
-        cell = ws.find(str(msg_id), in_column=9)
-        if not cell:
-            return None
-        row = ws.row_values(cell.row)
-        row += [""] * (len(self.EXP_COLS) - len(row))
-        return cell.row, dict(zip(self.EXP_COLS, row))
+        return self._expense_find("msg_id", msg_id)
 
     def expense_by_id(self, eid: int) -> tuple[int, dict] | None:
+        return self._expense_find("id", eid)
+
+    def _expense_find(self, name, value) -> tuple[int, dict] | None:
         ws = self.ws("expenses")
-        cell = ws.find(str(eid), in_column=1)
+        headers = self._expense_headers(ws)
+        cell = ws.find(str(value), in_column=headers.index(name) + 1)
         if not cell:
             return None
         row = ws.row_values(cell.row)
-        row += [""] * (len(self.EXP_COLS) - len(row))
-        return cell.row, dict(zip(self.EXP_COLS, row))
+        return cell.row, self._expense_record(headers, row)
 
     def expense_set(self, row_idx: int, **fields):
         ws = self.ws("expenses")
+        headers = self._expense_headers(ws)
         # One request: a sent message ID must not be separated from its sent flag.
-        ws.batch_update([{"range": gspread.utils.rowcol_to_a1(row_idx, self.EXP_COLS.index(k) + 1),
+        ws.batch_update([{"range": gspread.utils.rowcol_to_a1(row_idx, headers.index(k) + 1),
                           "values": [[v]]} for k, v in fields.items()], value_input_option="RAW")
 
 

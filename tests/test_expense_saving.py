@@ -32,6 +32,10 @@ class Worksheet:
         time.sleep(0.002)  # Yield to other writer threads while the read is in flight.
         return [dict(zip(self.rows[0], list(r) + [""] * (len(self.rows[0]) - len(r)))) for r in self.rows[1:]]
 
+    def get_all_values(self):
+        time.sleep(0.002)
+        return [list(row) for row in self.rows]
+
     def append_row(self, values, **kwargs):
         if self.fail_before_append:
             raise OSError("Sheets unavailable")
@@ -129,13 +133,42 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(self.ws.rows[1], original)
         self.assertEqual(self.ws.col_count, len(sheets.Sheets.EXP_COLS))
 
-    def test_migration_refuses_to_overwrite_custom_columns(self):
-        ws = Worksheet(sheets.Sheets.EXP_COLS[:10] + ["my notes"])
+    def test_migration_preserves_custom_columns_and_uses_names(self):
+        for extra in [["комментарий"], ["комментарий", "need_status", "request_hash", "ещё заметка"]]:
+            with self.subTest(extra=extra):
+                ws = Worksheet(sheets.Sheets.EXP_COLS[:10] + extra)
+                original = [7, "18.10.2026 20:00", "team", 12.5, "lime", "бар", "", "", 44, "", "не трогать"]
+                ws.rows.append(original[:])
+                sh = store(ws)
+                sh.book = SimpleNamespace(worksheets=lambda: [SimpleNamespace(title=n) for n in sh.HEADERS])
+                sh._ensure_sheets()
+                headers = list(ws.rows[0])
+                sh._ensure_sheets()
+                self.assertEqual(ws.rows[0], headers)
+                self.assertEqual(headers[:10 + len(extra)], sheets.Sheets.EXP_COLS[:10] + extra)
+                self.assertEqual(ws.rows[1], original)
+                rec, created = sh.expense_add_once("team", 5, "mint", "бар", request_key="same", request_hash="payload")
+                self.assertTrue(created)
+                row, saved = sh.expense_by_id(rec["id"])
+                self.assertEqual(saved["request_key"], "same")
+                self.assertEqual(saved["notification_status"], "pending")
+                # A column inserted after startup must also be respected.
+                for values in ws.rows:
+                    values.insert(10, "поздняя заметка" if values is ws.rows[0] else "ручное значение")
+                sh.expense_set(row, msg_id=55, notification_status="sent")
+                self.assertEqual(sh.expense_by_msg(55)[1]["notification_status"], "sent")
+                self.assertEqual(ws.rows[row - 1][10], "ручное значение")
+                self.assertEqual(ws.rows[1][11], "не трогать")
+                replay, created = sh.expense_add_once("team", 5, "mint", "бар", request_key="same", request_hash="payload")
+                self.assertFalse(created)
+                self.assertEqual(replay["id"], rec["id"])
+
+    def test_migration_reports_invalid_base_headers(self):
+        ws = Worksheet(["wrong"] + sheets.Sheets.EXP_COLS[1:10])
         sh = store(ws)
         sh.book = SimpleNamespace(worksheets=lambda: [SimpleNamespace(title=n) for n in sh.HEADERS])
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "первые 10 заголовков"):
             sh._ensure_sheets()
-        self.assertEqual(ws.rows[0][-1], "my notes")
 
 
 class ServiceAndApiTests(unittest.IsolatedAsyncioTestCase):
