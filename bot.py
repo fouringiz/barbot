@@ -613,7 +613,8 @@ async def close_need_from_text(text: str, who_: str, eid: int) -> str:
     return nm.group(1)
 
 
-PROMPTS: dict[int, int] = {}   # msg_id вопроса «Сумма?» -> msg_id записи (живёт до рестарта)
+PROMPTS: dict[int, int] = {}        # msg_id вопроса «Сумма?» -> msg_id записи (живёт до рестарта)
+MEDIA_GROUPS: dict[str, int] = {}   # media_group_id альбома -> msg_id первой записи
 
 
 def is_spent_topic(m: Message) -> bool:
@@ -635,9 +636,7 @@ async def spent_reply(m: Message):
     from_bot = target.from_user and target.from_user.id == bot.id
     found = await run(sh.expense_by_msg, target_id)
     if not found:
-        if from_bot:                                     # ответ на сводку/вопрос бота — не запись
-            return await react(m, "🤷")
-        return await spent_new(m)                        # реплай на чьё-то обычное сообщение
+        return                                           # реплай на разговор или на сводку бота — не запись
     row_idx, rec = found
     if text in ("❌", "x", "х", "-", "удали", "удалить"):
         await run(sh.expense_set, row_idx, deleted="да")
@@ -656,8 +655,18 @@ async def spent_new(m: Message):
     text = (m.text or m.caption or "").strip()
     amt = parse_amount(text)
     photo = msg_link(m) if (m.photo or m.document) else ""
-    if not photo and (amt is None and not re.search(r"[a-zа-я]", text.lower())):
-        return                                            # ❌, эмодзи, пустое — не запись
+    if not photo and amt is None:
+        return                                            # разговор в топике — не запись
+    if m.media_group_id:                                  # альбом: одна запись на все фото
+        first = MEDIA_GROUPS.get(m.media_group_id)
+        if first is not None:
+            if amt is not None:                           # подпись пришла на этом фото — дописываем первую запись
+                found = await run(sh.expense_by_msg, first)
+                if found and not str(found[1].get("amount", "")).strip():
+                    await run(sh.expense_set, found[0], amount=amt, text=text, category=exp_category(text))
+                    await react(m, "✅")
+            return
+        MEDIA_GROUPS[m.media_group_id] = m.message_id
     if not text:
         text = "чек"
     need_id = ""
@@ -669,11 +678,20 @@ async def spent_new(m: Message):
             if found:
                 await run(sh.expense_set, found[0], need_id=need_id)
     if amt is None:
-        await react(m, "❓")
-        q = await m.reply("Сумма? Ответь числом — на это сообщение или на запись.")
-        PROMPTS[q.message_id] = m.message_id
+        asyncio.create_task(ask_amount_later(m))
     else:
         await react(m, "✅")
+
+
+async def ask_amount_later(m: Message):
+    """Фото без суммы: ждём секунду — в альбоме подпись может быть на другом фото."""
+    await asyncio.sleep(2 if m.media_group_id else 0)
+    found = await run(sh.expense_by_msg, m.message_id)
+    if found and str(found[1].get("amount", "")).strip():
+        return
+    await react(m, "❓")
+    q = await m.reply("Сумма? Ответь числом — на это сообщение или на фото.")
+    PROMPTS[q.message_id] = m.message_id
 
 
 @dp.edited_message(F.func(is_spent_topic))
