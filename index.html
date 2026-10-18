@@ -64,6 +64,9 @@
   .btn.primary{background:var(--ink);color:var(--dark-text);border-color:var(--ink)}
   .btn.danger{color:var(--accent-dark);border-color:var(--red-bg);background:var(--red-bg)}
   .btn:disabled{opacity:.5}
+  .save-notice{padding:12px 14px;border-radius:12px;background:var(--gold-bg);color:var(--gold-ink);font-size:13px;line-height:1.5;margin:12px 0}
+  .resume{width:100%;margin-top:14px}
+  .delivery{font-size:12px;color:var(--muted);margin-top:4px;white-space:normal}
   .toast{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(100px + env(safe-area-inset-bottom,0px));background:var(--ink);color:var(--dark-text);padding:10px 16px;border-radius:12px;font-size:14px;font-weight:600;opacity:0;transition:opacity .2s;pointer-events:none}
   .toast.show{opacity:1}
   .gate{padding:60px 24px;text-align:center}
@@ -101,6 +104,7 @@
 
   <div class="section"><span>Записи</span><small id="pending"></small></div>
   <div class="list" id="list"></div>
+  <button class="btn resume" id="resume" hidden>Проверить сохранение покупки</button>
 </div>
 
 <div id="gate" class="gate wrap" hidden>
@@ -120,7 +124,7 @@
   </div>
   <div class="field">
     <label for="f-text">Что купили</label>
-    <input id="f-text" placeholder="лаймы 2 кг, мята" autocomplete="off">
+    <input id="f-text" placeholder="лаймы 2 кг, мята" autocomplete="off" maxlength="1000">
   </div>
   <div class="field">
     <label>Категория</label>
@@ -130,6 +134,7 @@
     <label for="f-need">Закрыть заявку № (необязательно)</label>
     <input id="f-need" inputmode="numeric" placeholder="14" autocomplete="off">
   </div>
+  <div class="save-notice" id="save-notice" role="status" hidden></div>
   <div class="actions">
     <button class="btn danger" id="btn-delete" hidden>Удалить</button>
     <button class="btn" id="btn-cancel">Отмена</button>
@@ -154,24 +159,33 @@ const devToken = new URLSearchParams(location.search).get("dev") || "";
 
 const $ = (s) => document.querySelector(s);
 let period = "day", editing = null, category = null;
+let saving = false, pendingCreate = null, pendingStorageKey = "", refreshTimer = null;
 
 function money(x){ return (Math.round(x*100)/100).toLocaleString("ru-RU",{minimumFractionDigits:0,maximumFractionDigits:2}) + " ₼"; }
 function toast(t){ const el=$("#toast"); el.textContent=t; el.classList.add("show"); setTimeout(()=>el.classList.remove("show"),1800); }
 function haptic(kind){ try{ tg && tg.HapticFeedback && (kind==="ok" ? tg.HapticFeedback.notificationOccurred("success") : tg.HapticFeedback.impactOccurred("light")); }catch(e){} }
 
 async function api(path, opts={}){
-  const headers = {"Content-Type":"application/json"};
+  const headers = {"Content-Type":"application/json", ...opts.headers};
   if (initData) headers["X-Telegram-Init-Data"] = initData;
   if (devToken) headers["X-Dev-Token"] = devToken;
-  const r = await fetch(API + path, {...opts, headers});
-  const data = await r.json().catch(()=>({}));
-  if (!r.ok) throw new Error(data.error || ("Ошибка " + r.status));
-  return data;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15000);
+  try {
+    const r = await fetch(API + path, {...opts, headers, signal:controller.signal});
+    const data = await r.json();
+    if (!r.ok) { const error = new Error(data.error || ("Ошибка " + r.status)); error.status = r.status; throw error; }
+    return data;
+  } finally { clearTimeout(timer); }
 }
 
 function labelFor(p){ return p==="day" ? "Сегодня" : p==="week" ? "7 дней" : "Месяц"; }
 
 function render(d){
+  clearTimeout(refreshTimer);
+  if (d.items.some(it => it.notification_status === "pending" || it.need_status === "pending")) {
+    refreshTimer = setTimeout(load, 30000);
+  }
   $("#period-label").textContent = labelFor(d.period);
   $("#month-total").textContent = "за месяц " + money(d.month_total);
   $("#total").textContent = money(d.total);
@@ -184,10 +198,12 @@ function render(d){
   if (!d.items.length){ list.innerHTML = `<div class="empty">Пока пусто. Плюс внизу — первая запись.</div>`; return; }
   list.innerHTML = d.items.map(it => {
     const c = CAT[it.category] || CAT["прочее"];
-    const meta = [it.who, it.date.slice(0,5) + " " + it.date.slice(11), it.need_id ? "заявка #" + it.need_id : "", it.photo ? "чек" : ""].filter(Boolean).join(" · ");
+    const need = it.need_id ? "заявка #" + it.need_id + (it.need_status === "pending" ? " · закрытие ожидается" : it.need_status === "not_found" ? " · не найдена" : "") : "";
+    const meta = [it.who, it.date.slice(0,5) + " " + it.date.slice(11), need, it.photo ? "чек" : ""].filter(Boolean).join(" · ");
+    const delivery = it.notification_status === "pending" ? "Сохранено · уведомление в Telegram ожидает отправки" : "";
     return `<button class="item" data-id="${it.id}">
       <div class="ic" style="background:${c.bg}">${c.icon}</div>
-      <div class="body"><div class="t">${esc(it.text)}</div><div class="m">${esc(meta)}</div></div>
+      <div class="body"><div class="t">${esc(it.text)}</div><div class="m">${esc(meta)}</div>${delivery ? `<div class="delivery">${delivery}</div>` : ""}</div>
       <div class="amt">${money(it.amount)}</div></button>`;
   }).join("");
   list.querySelectorAll(".item").forEach(b => b.addEventListener("click", () => openSheet(d.items.find(i => i.id == b.dataset.id))));
@@ -206,7 +222,25 @@ function renderCats(){
   $("#cats").querySelectorAll(".chip").forEach(b => b.addEventListener("click", () => { category = b.dataset.cat || null; renderCats(); haptic(); }));
 }
 
+function updateSaveState(){
+  const locked = saving || !!pendingCreate;
+  ["#f-amount", "#f-text", "#f-need"].forEach(id => $(id).disabled = locked);
+  $("#cats").querySelectorAll(".chip").forEach(b => b.disabled = locked);
+  $("#btn-save").disabled = saving;
+  $("#btn-delete").disabled = saving;
+  $("#btn-cancel").disabled = saving;
+  $("#btn-save").textContent = saving ? "Сохраняем…" : pendingCreate ? "Проверить сохранение" : editing ? "Сохранить" : "Записать";
+  $("#resume").hidden = !pendingCreate;
+}
+
+function forgetPending(){
+  pendingCreate = null;
+  try { localStorage.removeItem(pendingStorageKey); } catch(e) { /* A replay is still safe. */ }
+}
+
 function openSheet(item){
+  if (saving) return;
+  if (pendingCreate) item = null;
   editing = item || null;
   $("#sheet-title").textContent = item ? "Запись #" + item.id : "Новый расход";
   $("#f-amount").value = item ? item.amount : "";
@@ -214,30 +248,61 @@ function openSheet(item){
   $("#f-need").value = item ? (item.need_id || "") : "";
   $("#f-need").parentElement.hidden = !!item;
   category = item ? item.category : null;
+  if (pendingCreate) {
+    $("#f-amount").value = pendingCreate.body.amount;
+    $("#f-text").value = pendingCreate.body.text;
+    $("#f-need").value = pendingCreate.body.need_id;
+    category = pendingCreate.body.category;
+  }
   renderCats();
   $("#btn-delete").hidden = !item;
   $("#btn-save").textContent = item ? "Сохранить" : "Записать";
+  $("#save-notice").hidden = !pendingCreate;
+  $("#save-notice").textContent = pendingCreate ? "Ответ о сохранении не получен. Проверь эту покупку — повторная запись не появится." : "";
+  updateSaveState();
   $("#scrim").classList.add("open"); $("#sheet").classList.add("open");
   tg && tg.BackButton && tg.BackButton.show();
   setTimeout(() => (item ? $("#f-text") : $("#f-amount")).focus(), 250);
 }
-function closeSheet(){ $("#scrim").classList.remove("open"); $("#sheet").classList.remove("open"); tg && tg.BackButton && tg.BackButton.hide(); editing = null; }
+function closeSheet(){ if (saving) return; $("#scrim").classList.remove("open"); $("#sheet").classList.remove("open"); tg && tg.BackButton && tg.BackButton.hide(); editing = null; $("#fab").focus(); }
 
 async function save(){
-  const amount = parseFloat($("#f-amount").value.replace(",", "."));
+  if (saving || !$("#sheet").classList.contains("open")) return;
+  const amount = Number($("#f-amount").value.replace(",", "."));
   const text = $("#f-text").value.trim();
-  if (!(amount > 0)) return toast("Сумма — число больше нуля");
-  if (!text) return toast("Напиши, что купили");
-  $("#btn-save").disabled = true;
+  if (!Number.isFinite(amount) || !(amount > 0)) return toast("Сумма — число больше нуля");
+  if (!text || text.length > 1000) return toast("Описание покупки — от 1 до 1000 символов");
+  const wasEditing = !!editing;
+  if (!wasEditing && !pendingCreate) {
+    const need_id = $("#f-need").value.trim().replace(/^#/, "");
+    if (need_id && (!/^[0-9]{1,15}$/.test(need_id) || Number(need_id) < 1)) return toast("Номер заявки — целое число больше нуля");
+    const draft = {key:crypto.randomUUID(), body:{amount, text, category, need_id}};
+    try { localStorage.setItem(pendingStorageKey, JSON.stringify(draft)); }
+    catch(e){ return toast("Не удалось сохранить покупку на устройстве. Разреши хранилище и попробуй снова."); }
+    pendingCreate = draft;
+  }
+  saving = true; updateSaveState(); $("#save-notice").hidden = true;
   try {
+    let result;
     if (editing) await api("/api/expenses/" + editing.id, {method:"PATCH", body: JSON.stringify({amount, text, category})});
-    else await api("/api/expenses", {method:"POST", body: JSON.stringify({amount, text, category, need_id: $("#f-need").value.trim()})});
-    haptic("ok"); closeSheet(); await load(); toast(editing ? "Сохранено" : "Записано");
-  } catch(e){ toast(e.message); }
-  finally { $("#btn-save").disabled = false; }
+    else {
+      result = await api("/api/expenses", {method:"POST", headers:{"Idempotency-Key":pendingCreate.key}, body:JSON.stringify(pendingCreate.body)});
+      if (!Number.isInteger(result.id) || result.id < 1) throw new Error("Нет подтверждения сохранения");
+      forgetPending();
+    }
+    saving = false; updateSaveState(); haptic("ok"); closeSheet();
+    await load(); toast(result && result.deleted ? "Эта покупка уже была сохранена и удалена" : wasEditing ? "Сохранено" : "Расход сохранён");
+  } catch(e){
+    // Only a validation response proves that no append happened. Network/5xx/auth
+    // errors keep the SAME key and payload, including across a page reload.
+    if (!wasEditing && e.status === 400) forgetPending();
+    $("#save-notice").hidden = false;
+    $("#save-notice").textContent = pendingCreate ? "Ответ о сохранении не получен. Нажми «Проверить сохранение» — повторной записи не будет." : e.message;
+  }
+  finally { saving = false; updateSaveState(); }
 }
 async function remove(){
-  if (!editing) return;
+  if (!editing || saving) return;
   try { await api("/api/expenses/" + editing.id, {method:"DELETE"}); haptic("ok"); closeSheet(); await load(); toast("Удалено"); }
   catch(e){ toast(e.message); }
 }
@@ -247,9 +312,17 @@ async function boot(){
   if (!initData && !devToken){ $("#gate").hidden = false; return; }
   try {
     const me = await api("/api/me");
+    pendingStorageKey = "barbot:pending-expense:" + me.user.id;
+    const stored = localStorage.getItem(pendingStorageKey);
+    if (stored) {
+      const draft = JSON.parse(stored);
+      if (!draft || typeof draft.key !== "string" || !draft.body || !Number.isFinite(draft.body.amount) || typeof draft.body.text !== "string") throw new Error("Не удалось прочитать незавершённую покупку. Не создавай её повторно — проверь список расходов.");
+      pendingCreate = draft;
+    }
     $("#eyebrow").textContent = "Bakılı · " + (me.user.first_name || "команда");
     $("#app").hidden = false; $("#fab").hidden = false;
     await load();
+    if (pendingCreate) openSheet(null);
   } catch(e){
     $("#gate").hidden = false; $("#gate-text").textContent = e.message;
   }
@@ -259,6 +332,7 @@ document.querySelectorAll(".tab").forEach(b => b.addEventListener("click", () =>
   period = b.dataset.period; document.querySelectorAll(".tab").forEach(x => x.setAttribute("aria-pressed", x===b)); haptic(); load();
 }));
 $("#fab").addEventListener("click", () => openSheet(null));
+$("#resume").addEventListener("click", () => openSheet(null));
 $("#scrim").addEventListener("click", closeSheet);
 $("#btn-cancel").addEventListener("click", closeSheet);
 $("#btn-save").addEventListener("click", save);

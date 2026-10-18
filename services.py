@@ -1,4 +1,7 @@
 """Общая логика для бота и API: посты в топики, стоп-лист, меню для гостей."""
+import asyncio
+import hashlib
+import json
 import logging
 from datetime import datetime, timedelta
 
@@ -15,6 +18,8 @@ from utils import esc, fmt_money, now, parse_stamp, short, stamp
 log = logging.getLogger("barbot.services")
 
 bot: Bot | None = None   # выставляет main.py после создания Bot
+_outbox_wakeup = asyncio.Event()
+_outbox_lock = asyncio.Lock()
 
 
 def set_bot(b: Bot) -> None:
@@ -134,6 +139,9 @@ def _item(r: dict) -> dict:
         "id": int(r["id"]), "date": r.get("date", ""), "who": r.get("who", ""),
         "amount": r.get("_amt"), "text": r.get("text", ""), "category": r.get("category", ""),
         "need_id": str(r.get("need_id", "")), "photo": r.get("photo", ""),
+        "notification_status": r.get("notification_status", ""),
+        "need_status": r.get("need_status", ""),
+        "deleted": bool(str(r.get("deleted", "")).strip()),
     }
 
 
@@ -156,18 +164,66 @@ async def expenses_summary(period: str) -> dict:
 
 
 async def expense_create(who: str, amount: float, text: str, category: str | None = None,
-                         need_id: str = "", source: str = "app") -> dict:
-    """Запись расхода из приложения: строка в лист + пост в «Расходы», чтобы команда видела."""
+                         need_id: str = "", *, request_key: str) -> tuple[dict, bool]:
+    """Сохраняет покупку один раз; уведомление и закрытие заявки выполняет очередь."""
     cat = category or exp_category(text)
-    if need_id:
-        need_id = await close_need(int(need_id), who) or ""
-    eid = await run(sheets.get().expense_add, who, amount, text, cat, need_id, "", "")
-    msg = await post(TOPIC_SPENT, f"{CAT_ICON.get(cat, '•')} {esc(text)} — <b>{fmt_money(amount)}</b>\n👤 {esc(who)} · {stamp()[:5]} · из приложения")
-    if msg:
-        found = await run(sheets.get().expense_by_id, eid)
-        if found:
-            await run(sheets.get().expense_set, found[0], msg_id=msg.message_id)
-    return {"id": eid, "amount": amount, "text": text, "category": cat, "who": who, "need_id": need_id}
+    payload = json.dumps([amount, text, category, need_id], ensure_ascii=False, separators=(",", ":"))
+    fingerprint = hashlib.sha256(payload.encode()).hexdigest()
+    rec, created = await run(sheets.get().expense_add_once, who, amount, text, cat, need_id,
+                             request_key=request_key, request_hash=fingerprint)
+    _outbox_wakeup.set()
+    return _item(dict(rec, _amt=float(rec["amount"]))), created
+
+
+async def flush_expense_outbox() -> None:
+    """Pending work lives in Sheets and survives restarts. Never re-create the expense."""
+    async with _outbox_lock:
+        if bot is None or not GROUP_ID:
+            return
+        rows = await run(sheets.get().expenses)
+        for rec in rows:
+            if (rec.get("notification_status") != "pending" and rec.get("need_status") != "pending"):
+                continue
+            # Re-read: a user may have edited/deleted the expense since the scan.
+            found = await run(sheets.get().expense_by_id, int(rec["id"]))
+            if not found:
+                continue
+            row, rec = found
+            if str(rec.get("deleted", "")).strip():
+                await run(sheets.get().expense_set, row, notification_status="cancelled", need_status="cancelled")
+                continue
+            if rec.get("need_status") == "pending":
+                try:
+                    nid = await close_need(int(rec["need_id"]), rec["who"])
+                    await run(sheets.get().expense_set, row, need_status="done" if nid else "not_found")
+                except Exception:
+                    log.exception("expense #%s: need closure deferred", rec["id"])
+            if rec.get("notification_status") == "pending":
+                try:
+                    if rec.get("msg_id"):
+                        await run(sheets.get().expense_set, row, notification_status="sent")
+                        continue
+                    msg = await post(TOPIC_SPENT,
+                                     f"{CAT_ICON.get(rec['category'], '•')} {esc(rec['text'])} — "
+                                     f"<b>{fmt_money(float(rec['amount']))}</b>\n"
+                                     f"👤 {esc(rec['who'])} · {esc(rec['date'][:5])} · расход #{rec['id']}")
+                    if msg:
+                        await run(sheets.get().expense_set, row, msg_id=msg.message_id, notification_status="sent")
+                except Exception:
+                    log.exception("expense #%s: Telegram notification deferred", rec["id"])
+
+
+async def expense_outbox_worker() -> None:
+    while True:
+        _outbox_wakeup.clear()
+        try:
+            await flush_expense_outbox()
+        except Exception:
+            log.exception("expense outbox unavailable; retrying later")
+        try:
+            await asyncio.wait_for(_outbox_wakeup.wait(), timeout=30)
+        except asyncio.TimeoutError:
+            pass
 
 
 async def expense_update(eid: int, **fields) -> bool:

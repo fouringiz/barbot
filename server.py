@@ -1,9 +1,12 @@
 """HTTP API для Mini App. Публичные: /api/health, /api/menu. Остальное — только команда (см. auth)."""
 import logging
+import math
+from uuid import UUID
 
 from aiohttp import web
 
 import services as svc
+from sheets import ExpenseConflict
 from api.auth import auth
 from classify import CAT_ICON
 from config import PORT, WEB_ORIGIN
@@ -15,7 +18,7 @@ log = logging.getLogger("barbot.api")
 async def cors(request: web.Request, handler):
     resp = web.Response(status=204) if request.method == "OPTIONS" else await handler(request)
     resp.headers["Access-Control-Allow-Origin"] = WEB_ORIGIN or "*"
-    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Telegram-Init-Data, X-Dev-Token"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Telegram-Init-Data, X-Dev-Token, Idempotency-Key"
     resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, DELETE, OPTIONS"
     return resp
 
@@ -45,33 +48,59 @@ async def expenses_get(request: web.Request) -> web.Response:
 
 async def expenses_post(request: web.Request) -> web.Response:
     try:
+        key = str(UUID(request.headers.get("Idempotency-Key", "")))
+    except ValueError:
+        return web.json_response({"error": "обнови приложение: нужен ключ сохранения"}, status=400)
+    try:
         body = await request.json()
+        if not isinstance(body, dict):
+            raise ValueError
         amount = round(float(str(body.get("amount", "")).replace(",", ".")), 2)
     except (ValueError, TypeError):
         return web.json_response({"error": "amount: число"}, status=400)
-    text = str(body.get("text", "")).strip()
-    if amount <= 0 or not text:
-        return web.json_response({"error": "нужны сумма больше нуля и описание"}, status=400)
+    text = body.get("text", "")
+    text = text.strip() if isinstance(text, str) else ""
+    if not math.isfinite(amount) or amount <= 0 or not text or len(text) > 1000:
+        return web.json_response({"error": "нужны конечная сумма больше нуля и описание до 1000 символов"}, status=400)
     category = body.get("category") or None
-    if category and category not in CAT_ICON:
+    if category is not None and (not isinstance(category, str) or category not in CAT_ICON):
         return web.json_response({"error": "неизвестная категория"}, status=400)
     need_id = str(body.get("need_id", "") or "").lstrip("#")
-    item = await svc.expense_create(_who(request), amount, text, category, need_id)
-    return web.json_response(item, status=201)
+    if need_id and (not need_id.isascii() or not need_id.isdigit() or len(need_id) > 15 or int(need_id) < 1):
+        return web.json_response({"error": "номер заявки: целое число больше нуля"}, status=400)
+    need_id = str(int(need_id)) if need_id else ""
+    try:
+        item, created = await svc.expense_create(_who(request), amount, text, category, need_id,
+                                                request_key=f"app:{request['user']['id']}:{key}")
+    except ExpenseConflict as e:
+        return web.json_response({"error": str(e)}, status=409)
+    return web.json_response(item, status=201 if created else 200)
 
 
 async def expenses_patch(request: web.Request) -> web.Response:
     eid = int(request.match_info["id"])
-    body = await request.json()
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise ValueError
+    except ValueError:
+        return web.json_response({"error": "ожидается объект JSON"}, status=400)
     fields = {}
     if "amount" in body:
         try:
             fields["amount"] = round(float(str(body["amount"]).replace(",", ".")), 2)
         except ValueError:
             return web.json_response({"error": "amount: число"}, status=400)
+        if not math.isfinite(fields["amount"]) or fields["amount"] <= 0:
+            return web.json_response({"error": "сумма должна быть конечным числом больше нуля"}, status=400)
     if "text" in body:
-        fields["text"] = str(body["text"]).strip()
-    if body.get("category") in CAT_ICON:
+        fields["text"] = body["text"].strip() if isinstance(body["text"], str) else ""
+        if not fields["text"] or len(fields["text"]) > 1000:
+            return web.json_response({"error": "описание: от 1 до 1000 символов"}, status=400)
+    category = body.get("category")
+    if category is not None and (not isinstance(category, str) or category not in CAT_ICON):
+        return web.json_response({"error": "неизвестная категория"}, status=400)
+    if category:
         fields["category"] = body["category"]
     if not fields:
         return web.json_response({"error": "нечего менять"}, status=400)
