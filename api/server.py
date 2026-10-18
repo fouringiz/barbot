@@ -1,4 +1,5 @@
 """HTTP API для Mini App. Публичные: /api/health, /api/menu. Остальное — только команда (см. auth)."""
+import json
 import logging
 import math
 from uuid import UUID
@@ -8,8 +9,9 @@ from aiohttp import web
 import services as svc
 from sheets import ExpenseConflict
 from api.auth import auth
-from classify import CAT_ICON
+from classify import CAT_ICON, TYPE_ICON, classify
 from config import PORT, WEB_ORIGIN
+from utils import short, stamp
 
 log = logging.getLogger("barbot.api")
 
@@ -113,6 +115,97 @@ async def expenses_delete(request: web.Request) -> web.Response:
     return web.json_response({"ok": ok}, status=200 if ok else 404)
 
 
+def _json_object(body):
+    if not isinstance(body, dict):
+        raise ValueError
+    return body
+
+
+# --- stop-list
+async def stop_get(_: web.Request) -> web.Response:
+    return web.json_response(await svc.stop_state())
+
+
+async def stop_post(request: web.Request) -> web.Response:
+    try:
+        body = _json_object(await request.json())
+    except ValueError:
+        return web.json_response({"error": "ожидается объект JSON"}, status=400)
+    item = body.get("item", "")
+    item = item.strip() if isinstance(item, str) else ""
+    if not item or len(item) > 100:
+        return web.json_response({"error": "item: от 1 до 100 символов"}, status=400)
+    if body.get("on", True):
+        res = await svc.stop_add(item, _who(request))
+        return web.json_response(res or {"item": item, "affected": [], "already": True})
+    ok = await svc.stop_remove(item, _who(request))
+    return web.json_response({"ok": ok}, status=200 if ok else 404)
+
+
+# --- needs
+async def needs_get(_: web.Request) -> web.Response:
+    return web.json_response({"items": await svc.needs_open(), "types": list(TYPE_ICON)})
+
+
+async def needs_post(request: web.Request) -> web.Response:
+    try:
+        body = _json_object(await request.json())
+    except ValueError:
+        return web.json_response({"error": "ожидается объект JSON"}, status=400)
+    text = body.get("text", "")
+    text = text.strip() if isinstance(text, str) else ""
+    if not text or len(text) > 1000:
+        return web.json_response({"error": "text: от 1 до 1000 символов"}, status=400)
+    type_ = body.get("type") or None
+    if type_ is not None and (not isinstance(type_, str) or type_ not in TYPE_ICON):
+        return web.json_response({"error": "неизвестный тип"}, status=400)
+    type_ = type_ or classify(text)
+    nid = await svc.add_need(type_, text, _who(request))
+    return web.json_response({"id": nid, "type": type_, "text": text, "who": _who(request), "created": short(stamp())},
+                             status=201)
+
+
+async def needs_close(request: web.Request) -> web.Response:
+    """Закрыть заявку; с суммой — ещё и записать расход по ней (идемпотентно по Idempotency-Key)."""
+    nid = int(request.match_info["id"])
+    try:
+        raw = (await request.text()).strip()
+        body = _json_object(json.loads(raw)) if raw else {}
+    except ValueError:
+        return web.json_response({"error": "ожидается объект JSON"}, status=400)
+    amount = body.get("amount")
+    if amount in (None, ""):
+        rec = await svc.need_close(nid, _who(request), strict_summary=False)
+        return web.json_response({"ok": rec is not None, "already": bool(rec and rec.get("already"))},
+                                 status=200 if rec is not None else 404)
+    try:
+        key = str(UUID(request.headers.get("Idempotency-Key", "")))
+    except ValueError:
+        return web.json_response({"error": "обнови приложение: нужен ключ сохранения"}, status=400)
+    try:
+        amount = round(float(str(amount).replace(",", ".")), 2)
+    except (ValueError, TypeError):
+        return web.json_response({"error": "amount: число"}, status=400)
+    text = body.get("text", "")
+    text = text.strip() if isinstance(text, str) else ""
+    if not math.isfinite(amount) or amount <= 0 or not text or len(text) > 1000:
+        return web.json_response({"error": "нужны конечная сумма больше нуля и описание до 1000 символов"}, status=400)
+    category = body.get("category") or None
+    if category is not None and (not isinstance(category, str) or category not in CAT_ICON):
+        return web.json_response({"error": "неизвестная категория"}, status=400)
+    try:
+        item, created = await svc.expense_create(_who(request), amount, text, category, str(nid),
+                                                request_key=f"app:{request['user']['id']}:{key}")
+    except ExpenseConflict as e:
+        return web.json_response({"error": str(e)}, status=409)
+    return web.json_response({"ok": True, "expense": item}, status=201 if created else 200)
+
+
+# --- specs
+async def specs_get(_: web.Request) -> web.Response:
+    return web.json_response({"items": await svc.specs_all()})
+
+
 def make_app() -> web.Application:
     app = web.Application(middlewares=[cors, auth])
     r = app.router
@@ -123,6 +216,12 @@ def make_app() -> web.Application:
     r.add_post("/api/expenses", expenses_post)
     r.add_patch(r"/api/expenses/{id:\d+}", expenses_patch)
     r.add_delete(r"/api/expenses/{id:\d+}", expenses_delete)
+    r.add_get("/api/stop", stop_get)
+    r.add_post("/api/stop", stop_post)
+    r.add_get("/api/needs", needs_get)
+    r.add_post("/api/needs", needs_post)
+    r.add_post(r"/api/needs/{id:\d+}/close", needs_close)
+    r.add_get("/api/specs", specs_get)
     r.add_route("OPTIONS", "/api/{tail:.*}", health)
     return app
 

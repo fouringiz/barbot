@@ -16,12 +16,11 @@ from apscheduler.triggers.cron import CronTrigger
 
 import services as svc
 import sheets
-from classify import (NEED_RE, TYPE_ICON, TYPE_ORDER, classify, exp_category, is_dismiss, need_line,
-                      parse_amount)
+from classify import NEED_RE, TYPE_ICON, classify, exp_category, is_dismiss, parse_amount
 from config import APP_LINK, CLOSE_HOUR, CLOSE_MIN, GROUP_ID, TOPIC_NEEDS, TOPIC_SPENT, TOPIC_STOP
 from sheets import run
-from specs import affected, card, find_spec, spec_names, spec_parts, tok_match
-from utils import esc, fmt_money, norm, now, parse_stamp, ru_day, short, stamp, RU_MONTHS
+from specs import card, find_spec, spec_names, spec_parts, tok_match
+from utils import esc, fmt_money, norm, now, parse_stamp, ru_day, short, RU_MONTHS
 
 log = logging.getLogger("barbot.team")
 router = Router(name="team")
@@ -201,21 +200,12 @@ async def cmd_stop(m: Message, command: CommandObject):
     sign, item = args[0], args[1:].strip()
     if sign not in "+-" or not item:
         return await m.reply("Как: /stop + лайм  или  /stop - лайм")
-    specs = await run(sheets.get().specs)
     if sign == "+":
-        current = [norm(r["item"]) for r in await run(sheets.get().stoplist)]
-        if norm(item) in current:
+        if await svc.stop_add(item, who(m)) is None:
             return await m.reply(f"«{esc(item)}» уже в стопе.")
-        await run(sheets.get().stop_add, item, who(m))
-        text = f"⛔ <b>В стопе:</b> {esc(item)} — {esc(who(m))}, {stamp()}"
-        hit = affected(specs, item)
-        if hit:
-            text += "\nПадают: " + esc(", ".join(hit))
     else:
-        if not await run(sheets.get().stop_remove, item):
+        if not await svc.stop_remove(item, who(m)):
             return await m.reply(f"«{esc(item)}» в стопе нет.")
-        text = f"✅ <b>Снят со стопа:</b> {esc(item)} — {esc(who(m))}, {stamp()}"
-    await svc.post(TOPIC_STOP, text)
     if not in_topic(m, TOPIC_STOP):
         await m.reply("Готово, запостил в «Стоп-лист».")
 

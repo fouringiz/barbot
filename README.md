@@ -36,7 +36,7 @@ services.py      общая логика бота и API: post(), стоп-ли�
 bots/team.py     командный бот: роутер, хендлеры, дайджесты
 api/auth.py      проверка Telegram initData + членство в группе
 api/server.py    aiohttp: /api/health, /api/menu, /api/me, /api/expenses (+CORS)
-docs/team/       фронт Mini App «Команда» (GitHub Pages)
+docs/team/       фронт Mini App «Команда»: расходы · заявки · стоп-лист · спеки (GitHub Pages)
 ```
 
 Листы таблицы создаются сами при старте: `specs` (импортируй `specs_example.csv`), `stoplist`, `needs`, `expenses`, `state` (ID постоянной сводки заявок по группе и топику).
@@ -58,6 +58,12 @@ docs/team/       фронт Mini App «Команда» (GitHub Pages)
 | POST | `/api/expenses` `{amount, text, category?, need_id?}` | команда — запись + пост в «Расходы», закрытие заявки |
 | PATCH | `/api/expenses/{id}` `{amount?, text?, category?}` | команда |
 | DELETE | `/api/expenses/{id}` | команда |
+| GET | `/api/needs` | команда — открытые заявки |
+| POST | `/api/needs` `{text, type?}` | команда — заявка + пост в «Заявки» + сводка |
+| POST | `/api/needs/{id}/close` `{amount?, text?, category?}` | команда — закрыть; с суммой — ещё и расход, нужен `Idempotency-Key` |
+| GET | `/api/stop` | команда — что в стопе (с упавшими коктейлями) + все ингредиенты карты |
+| POST | `/api/stop` `{item, on}` | команда — поставить/снять, пост в «Стоп-лист» |
+| GET | `/api/specs` | команда — все спеки с пометкой ингредиентов в стопе |
 
 Авторизация: заголовок `X-Telegram-Init-Data` (Mini App кладёт сам); подпись проверяется токеном бота, пользователь
 должен состоять в группе. Для теста без Telegram: `DEV_TOKEN` и заголовок `X-Dev-Token` (фронт: `?dev=<token>`).
@@ -124,7 +130,7 @@ Google Sheets не предоставляет межпроцессную уни�
 Установить `requirements.txt` в отдельное окружение Python 3.11+, затем:
 
 ```sh
-python -m unittest discover -s tests -p test_expense_saving.py -v
+python -m unittest discover -s tests -p "test_*.py" -v
 node --test tests/test_expense_ui.cjs
 ```
 
@@ -133,6 +139,7 @@ node --test tests/test_expense_ui.cjs
 покупки в интерфейсе после обновления страницы. Они не обращаются к рабочим Telegram/Google Sheets.
 Проверки `test_needs.py` и `test_classification.py` проверяют форматирование списка, восстановление
 постоянной сводки и типизацию заявок без обращения к Telegram или Google Sheets.
+`test_team_api.py` — роуты стопа, заявок и спеков, включая идемпотентное «Закрыл + расход».
 Отдельный запуск: `PYTHONPATH=tests python -m unittest test_needs test_classification -q`.
 
 ## Как расширять
