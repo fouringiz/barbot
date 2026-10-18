@@ -2,6 +2,7 @@
 import asyncio
 import logging
 from datetime import datetime, timedelta
+from threading import RLock
 
 import gspread
 
@@ -12,27 +13,60 @@ log = logging.getLogger("barbot.sheets")
 
 class Sheets:
     def __init__(self):
+        self._expense_lock = RLock()
         gc = gspread.service_account_from_dict(CREDS)
         self.book = gc.open_by_key(SHEET_ID)
         self._ensure_sheets()
         self._specs: list[dict] = []
         self._specs_at = datetime.min.replace(tzinfo=TZ)
 
+    EXP_COLS = ["id", "date", "who", "amount", "text", "category", "need_id", "photo", "msg_id", "deleted",
+                "request_key", "request_hash", "notification_status", "need_status"]
+
     HEADERS = {
         "specs": ["name", "aliases", "ingredients", "method", "glass", "garnish", "pitch", "tags"],
         "stoplist": ["item", "since", "who", "note"],
         "needs": ["id", "type", "text", "who", "created", "closed_by", "closed_at", "msg_id"],
-        "expenses": ["id", "date", "who", "amount", "text", "category", "need_id", "photo", "msg_id", "deleted"],
+        "expenses": EXP_COLS,
+        "state": ["key", "value"],
     }
 
     def _ensure_sheets(self):
-        """Создаёт недостающие листы с заголовками; существующие не трогает."""
+        """Создаёт листы; добавляет служебные колонки расходов без изменения старых строк."""
         existing = {w.title for w in self.book.worksheets()}
         for name, hdr in self.HEADERS.items():
             if name not in existing:
                 w = self.book.add_worksheet(title=name, rows=200, cols=len(hdr))
                 w.append_row(hdr)
                 log.info("created sheet %s", name)
+        ws = self.ws("expenses")
+        headers = ws.row_values(1)
+        self._validate_expense_headers(headers, require_metadata=False)
+        missing = [name for name in self.EXP_COLS[10:] if name not in headers]
+        if missing:
+            width = len(headers) + len(missing)
+            if ws.col_count < width:
+                ws.resize(cols=width)
+            start = gspread.utils.rowcol_to_a1(1, len(headers) + 1)
+            end = gspread.utils.rowcol_to_a1(1, width)
+            ws.update(values=[missing], range_name=f"{start}:{end}")
+
+    def _validate_expense_headers(self, headers, require_metadata=True):
+        if headers[:10] != self.EXP_COLS[:10]:
+            raise ValueError("expenses: первые 10 заголовков должны быть " + ", ".join(self.EXP_COLS[:10])
+                             + "; получено: " + repr(headers[:10]))
+        for name in self.EXP_COLS[10:]:
+            if headers.count(name) > 1 or (require_metadata and name not in headers):
+                raise ValueError(f"expenses: нужна ровно одна служебная колонка {name!r}")
+
+    def _expense_headers(self, ws):
+        headers = ws.row_values(1)
+        self._validate_expense_headers(headers)
+        return headers
+
+    def _expense_record(self, headers, row):
+        return {name: row[i] if i < len(row) else ""
+                for i, name in enumerate(headers) if name in self.EXP_COLS}
 
     def ws(self, name):
         return self.book.worksheet(name)
@@ -93,42 +127,82 @@ class Sheets:
         rec["already"] = False
         return rec
 
+    def summary_id(self, key: str) -> int | None:
+        ws = self.ws("state")
+        for rec in ws.get_all_records():
+            if str(rec.get("key", "")) == key and str(rec.get("value", "")).isdigit():
+                return int(rec["value"])
+        return None
+
+    def set_summary_id(self, key: str, msg_id: int) -> None:
+        ws = self.ws("state")
+        for row, rec in enumerate(ws.get_all_records(), start=2):
+            if str(rec.get("key", "")) == key:
+                ws.update_cell(row, 2, msg_id)
+                return
+        ws.append_row([key, msg_id])
+
 
     # --- expenses
-    EXP_COLS = ["id", "date", "who", "amount", "text", "category", "need_id", "photo", "msg_id", "deleted"]
-
     def expenses(self) -> list[dict]:
-        return [r for r in self.ws("expenses").get_all_records() if str(r.get("id", "")).strip()]
+        values = self.ws("expenses").get_all_values()
+        headers = values[0] if values else []
+        self._validate_expense_headers(headers)
+        rows = [self._expense_record(headers, row) for row in values[1:]]
+        return [r for r in rows if str(r["id"]).strip()]
 
     def expense_add(self, who, amount, text, category, need_id="", photo="", msg_id="") -> int:
-        ids = [int(r["id"]) for r in self.expenses() if str(r["id"]).isdigit()]
-        eid = max(ids, default=0) + 1
-        self.ws("expenses").append_row([eid, stamp(), who, amount if amount is not None else "", text, category,
-                                        need_id, photo, msg_id, ""])
-        return eid
+        rec, _ = self.expense_add_once(who, amount, text, category, need_id, photo, msg_id)
+        return int(rec["id"])
+
+    def expense_add_once(self, who, amount, text, category, need_id="", photo="", msg_id="",
+                         request_key="", request_hash="") -> tuple[dict, bool]:
+        # All writers (bot and API) share this lock. Deploy exactly one worker.
+        # Keep the key and pending work in the SAME append as the expense itself.
+        with self._expense_lock:
+            rows = self.expenses()
+            for rec in rows:
+                if request_key and rec.get("request_key") == request_key:
+                    if rec.get("request_hash") != request_hash:
+                        raise ExpenseConflict("этот запрос уже использован для другой покупки")
+                    return rec, False
+                if msg_id and str(rec.get("msg_id", "")) == str(msg_id):
+                    return rec, False
+            ids = [int(r["id"]) for r in rows if str(r["id"]).isdigit()]
+            values = [max(ids, default=0) + 1, stamp(), who, amount if amount is not None else "", text,
+                      category, need_id, photo, msg_id, "", request_key, request_hash,
+                      "pending" if request_key else "", "pending" if request_key and need_id else ""]
+            rec = dict(zip(self.EXP_COLS, values))
+            ws = self.ws("expenses")
+            headers = self._expense_headers(ws)
+            ws.append_row([rec.get(name, "") for name in headers], value_input_option="RAW")
+            return rec, True
 
     def expense_by_msg(self, msg_id: int) -> tuple[int, dict] | None:
-        ws = self.ws("expenses")
-        cell = ws.find(str(msg_id), in_column=9)
-        if not cell:
-            return None
-        row = ws.row_values(cell.row)
-        row += [""] * (len(self.EXP_COLS) - len(row))
-        return cell.row, dict(zip(self.EXP_COLS, row))
+        return self._expense_find("msg_id", msg_id)
 
     def expense_by_id(self, eid: int) -> tuple[int, dict] | None:
+        return self._expense_find("id", eid)
+
+    def _expense_find(self, name, value) -> tuple[int, dict] | None:
         ws = self.ws("expenses")
-        cell = ws.find(str(eid), in_column=1)
+        headers = self._expense_headers(ws)
+        cell = ws.find(str(value), in_column=headers.index(name) + 1)
         if not cell:
             return None
         row = ws.row_values(cell.row)
-        row += [""] * (len(self.EXP_COLS) - len(row))
-        return cell.row, dict(zip(self.EXP_COLS, row))
+        return cell.row, self._expense_record(headers, row)
 
     def expense_set(self, row_idx: int, **fields):
         ws = self.ws("expenses")
-        for k, v in fields.items():
-            ws.update_cell(row_idx, self.EXP_COLS.index(k) + 1, v)
+        headers = self._expense_headers(ws)
+        # One request: a sent message ID must not be separated from its sent flag.
+        ws.batch_update([{"range": gspread.utils.rowcol_to_a1(row_idx, headers.index(k) + 1),
+                          "values": [[v]]} for k, v in fields.items()], value_input_option="RAW")
+
+
+class ExpenseConflict(ValueError):
+    """An idempotency key was reused with a different request body."""
 
 
 async def run(fn, *args, **kwargs):
@@ -137,11 +211,13 @@ async def run(fn, *args, **kwargs):
 
 
 _sh: Sheets | None = None
+_init_lock = RLock()
 
 
 def get() -> Sheets:
     """Ленивый синглтон — таблица открывается при первом обращении."""
     global _sh
-    if _sh is None:
-        _sh = Sheets()
-    return _sh
+    with _init_lock:
+        if _sh is None:
+            _sh = Sheets()
+        return _sh

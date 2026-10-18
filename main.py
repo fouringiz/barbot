@@ -1,6 +1,7 @@
 """Точка входа: командный бот (polling) + HTTP API в одном процессе."""
 import asyncio
 import logging
+from contextlib import suppress
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -8,6 +9,7 @@ from aiogram.enums import ParseMode
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 import services as svc
+import sheets
 from api import server
 from bots import team
 from config import BOT_TOKEN, TZ
@@ -17,8 +19,14 @@ log = logging.getLogger("barbot")
 
 
 async def main() -> None:
+    await asyncio.to_thread(sheets.get)
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     svc.set_bot(bot)
+    try:
+        async with svc._needs_lock:
+            await svc.refresh_needs_summary()
+    except Exception:
+        log.exception("startup needs summary refresh failed; will retry after the next need change")
 
     dp = Dispatcher()
     dp.include_router(team.router)
@@ -31,7 +39,13 @@ async def main() -> None:
     await bot.set_my_commands(team.COMMANDS)
     await bot.delete_webhook(drop_pending_updates=True)
     log.info("polling started")
-    await dp.start_polling(bot)
+    outbox = asyncio.create_task(svc.expense_outbox_worker())
+    try:
+        await dp.start_polling(bot)
+    finally:
+        outbox.cancel()
+        with suppress(asyncio.CancelledError):
+            await outbox
 
 
 if __name__ == "__main__":

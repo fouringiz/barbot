@@ -1,13 +1,17 @@
 """Общая логика для бота и API: посты в топики, стоп-лист, меню для гостей."""
+import asyncio
+import hashlib
+import json
 import logging
 from datetime import datetime, timedelta
 
 from aiogram import Bot
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import Message
 
 import sheets
-from classify import CAT_ICON, exp_category, need_line
-from config import CLOSE_HOUR, CLOSE_MIN, GROUP_ID, TOPIC_SPENT
+from classify import CAT_ICON, TYPE_ICON, TYPE_ORDER, exp_category, need_line
+from config import CLOSE_HOUR, CLOSE_MIN, GROUP_ID, TOPIC_NEEDS, TOPIC_SPENT
 from sheets import run
 from specs import spec_names, tok_match
 from utils import esc, fmt_money, now, parse_stamp, short, stamp
@@ -15,6 +19,9 @@ from utils import esc, fmt_money, now, parse_stamp, short, stamp
 log = logging.getLogger("barbot.services")
 
 bot: Bot | None = None   # выставляет main.py после создания Bot
+_outbox_wakeup = asyncio.Event()
+_outbox_lock = asyncio.Lock()
+_needs_lock = asyncio.Lock()
 
 
 def set_bot(b: Bot) -> None:
@@ -68,17 +75,148 @@ async def menu_for_guests() -> list[dict]:
 
 
 # ---------------------------------------------------------------- needs
-async def close_need(nid: int, who: str) -> str:
-    """Закрыть заявку и зачеркнуть её пост. Возвращает id строкой или '' если нет/уже закрыта."""
-    rec = await run(sheets.get().need_close, nid, who)
-    if not rec:
-        return ""
-    if not rec["already"] and rec.get("msg_id"):
+def _utf16_len(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2
+
+
+def needs_lines(rows: list[dict]) -> list[str]:
+    """Build escaped display rows, clipping only presentation text, never sheet data."""
+    lines = ["📋 <b>Открытые заявки</b>"]
+    for type_ in TYPE_ORDER:
+        group = [r for r in rows if r.get("type") == type_]
+        if not group:
+            continue
+        lines.append(f"{TYPE_ICON.get(type_, '•')} <b>{type_}</b>")
+        for r in group:
+            request = str(r.get("text", ""))
+            if len(request) > 350:
+                request = request[:349] + "…"
+            author = str(r.get("who", ""))[:100]
+            nid = str(r["id"])[:20]
+            lines.append(f"#{esc(nid)} {esc(request)} <i>— {esc(author)}, {esc(short(r.get('created', '')))}</i>")
+    return lines
+
+
+def needs_pages(rows: list[dict], limit: int = 3900) -> list[str]:
+    lines = needs_lines(rows)
+    pages, current = [], ""
+    for line in lines:
+        candidate = f"{current}\n{line}" if current else line
+        if current and _utf16_len(candidate) > limit:
+            pages.append(current)
+            current = line
+        else:
+            current = candidate
+    if current:
+        pages.append(current)
+    pages[-1] += "\n\nЗакрыть: /done &lt;номер&gt;"
+    return pages
+
+
+def needs_summary(rows: list[dict], limit: int = 3900) -> str:
+    lines = needs_lines(rows)
+    if len(lines) == 1:
+        return "✅ Открытых заявок нет"
+    out = []
+    overflow = f"\n… ещё {len(rows)} заявок — /needs"
+    for line in lines:
+        candidate = "\n".join([*out, line])
+        if _utf16_len(candidate + overflow) > limit:
+            break
+        out.append(line)
+    shown_requests = sum(line.startswith("#") for line in out)
+    remaining = max(0, len(rows) - shown_requests)
+    if remaining:
+        out.append(f"… ещё {remaining} заявок — /needs")
+    return "\n".join(out)
+
+
+def _summary_key() -> str:
+    # Reuse the key written by the original bot so upgrades edit the same message.
+    return f"needs:{GROUP_ID}:{TOPIC_NEEDS}"
+
+
+def _is_not_modified(exc: Exception) -> bool:
+    return isinstance(exc, TelegramBadRequest) and "message is not modified" in str(exc).lower()
+
+
+def _is_missing_message(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return isinstance(exc, TelegramBadRequest) and (
+        "message to edit not found" in msg or "message can't be edited" in msg
+    )
+
+
+async def refresh_needs_summary() -> None:
+    if not GROUP_ID or bot is None:
+        log.info("needs summary refresh skipped: group or bot is not configured")
+        return
+    rows = [r for r in await run(sheets.get().needs) if not str(r.get("closed_at", "")).strip()]
+    text = needs_summary(rows)
+    sid = await run(sheets.get().summary_id, _summary_key())
+    if sid:
         try:
-            await bot.edit_message_text(need_line(rec, closed=True), chat_id=GROUP_ID, message_id=int(rec["msg_id"]))
-        except Exception as e:
-            log.warning("edit need post #%s: %s", nid, e)
-    return str(nid)
+            await bot.edit_message_text(text, chat_id=GROUP_ID, message_id=sid)
+            return
+        except Exception as exc:
+            if _is_not_modified(exc):
+                return
+            if not _is_missing_message(exc):
+                log.exception("refresh needs summary failed")
+                raise
+            log.info("needs summary message %s disappeared; recreating", sid)
+    msg = await post(TOPIC_NEEDS, text)
+    if msg:
+        await run(sheets.get().set_summary_id, _summary_key(), msg.message_id)
+
+
+async def add_need(type_: str, text: str, who: str) -> int:
+    async with _needs_lock:
+        nid = await run(sheets.get().need_add, type_, text, who)
+        rec = {"id": nid, "type": type_, "text": text, "who": who, "created": stamp()}
+        try:
+            msg = await post(TOPIC_NEEDS, need_line(rec))
+            if msg:
+                await run(sheets.get().need_set_msg, nid, msg.message_id)
+        except Exception:
+            log.exception("need #%s saved but individual post failed", nid)
+        try:
+            await refresh_needs_summary()
+        except Exception:
+            # The durable request exists; do not report the add as failed to its author.
+            log.exception("need #%s saved but summary refresh failed", nid)
+        return nid
+
+
+async def need_close(nid: int, who: str, *, strict_summary: bool = False) -> dict | None:
+    async with _needs_lock:
+        rec = await run(sheets.get().need_close, nid, who)
+        if rec and not rec["already"] and rec.get("msg_id"):
+            try:
+                await bot.edit_message_text(need_line(rec, closed=True), chat_id=GROUP_ID,
+                                            message_id=int(rec["msg_id"]))
+            except Exception as exc:
+                log.warning("edit need post #%s: %s", nid, exc)
+                if _is_missing_message(exc):
+                    try:
+                        await post(TOPIC_NEEDS, need_line(rec, closed=True))
+                    except Exception:
+                        log.exception("closed need #%s saved but replacement post failed", nid)
+        if rec:
+            # Also refresh for already-closed rows: a prior refresh may have failed.
+            try:
+                await refresh_needs_summary()
+            except Exception:
+                if strict_summary:
+                    raise
+                log.exception("need #%s closure saved but summary refresh failed", nid)
+        return rec
+
+
+async def close_need(nid: int, who: str) -> str:
+    """Close a need and refresh its summary; return its id if it exists."""
+    rec = await need_close(nid, who, strict_summary=True)
+    return str(nid) if rec else ""
 
 
 # ---------------------------------------------------------------- expenses
@@ -134,6 +272,9 @@ def _item(r: dict) -> dict:
         "id": int(r["id"]), "date": r.get("date", ""), "who": r.get("who", ""),
         "amount": r.get("_amt"), "text": r.get("text", ""), "category": r.get("category", ""),
         "need_id": str(r.get("need_id", "")), "photo": r.get("photo", ""),
+        "notification_status": r.get("notification_status", ""),
+        "need_status": r.get("need_status", ""),
+        "deleted": bool(str(r.get("deleted", "")).strip()),
     }
 
 
@@ -156,18 +297,66 @@ async def expenses_summary(period: str) -> dict:
 
 
 async def expense_create(who: str, amount: float, text: str, category: str | None = None,
-                         need_id: str = "", source: str = "app") -> dict:
-    """Запись расхода из приложения: строка в лист + пост в «Расходы», чтобы команда видела."""
+                         need_id: str = "", *, request_key: str) -> tuple[dict, bool]:
+    """Сохраняет покупку один раз; уведомление и закрытие заявки выполняет очередь."""
     cat = category or exp_category(text)
-    if need_id:
-        need_id = await close_need(int(need_id), who) or ""
-    eid = await run(sheets.get().expense_add, who, amount, text, cat, need_id, "", "")
-    msg = await post(TOPIC_SPENT, f"{CAT_ICON.get(cat, '•')} {esc(text)} — <b>{fmt_money(amount)}</b>\n👤 {esc(who)} · {stamp()[:5]} · из приложения")
-    if msg:
-        found = await run(sheets.get().expense_by_id, eid)
-        if found:
-            await run(sheets.get().expense_set, found[0], msg_id=msg.message_id)
-    return {"id": eid, "amount": amount, "text": text, "category": cat, "who": who, "need_id": need_id}
+    payload = json.dumps([amount, text, category, need_id], ensure_ascii=False, separators=(",", ":"))
+    fingerprint = hashlib.sha256(payload.encode()).hexdigest()
+    rec, created = await run(sheets.get().expense_add_once, who, amount, text, cat, need_id,
+                             request_key=request_key, request_hash=fingerprint)
+    _outbox_wakeup.set()
+    return _item(dict(rec, _amt=float(rec["amount"]))), created
+
+
+async def flush_expense_outbox() -> None:
+    """Pending work lives in Sheets and survives restarts. Never re-create the expense."""
+    async with _outbox_lock:
+        if bot is None or not GROUP_ID:
+            return
+        rows = await run(sheets.get().expenses)
+        for rec in rows:
+            if (rec.get("notification_status") != "pending" and rec.get("need_status") != "pending"):
+                continue
+            # Re-read: a user may have edited/deleted the expense since the scan.
+            found = await run(sheets.get().expense_by_id, int(rec["id"]))
+            if not found:
+                continue
+            row, rec = found
+            if str(rec.get("deleted", "")).strip():
+                await run(sheets.get().expense_set, row, notification_status="cancelled", need_status="cancelled")
+                continue
+            if rec.get("need_status") == "pending":
+                try:
+                    nid = await close_need(int(rec["need_id"]), rec["who"])
+                    await run(sheets.get().expense_set, row, need_status="done" if nid else "not_found")
+                except Exception:
+                    log.exception("expense #%s: need closure deferred", rec["id"])
+            if rec.get("notification_status") == "pending":
+                try:
+                    if rec.get("msg_id"):
+                        await run(sheets.get().expense_set, row, notification_status="sent")
+                        continue
+                    msg = await post(TOPIC_SPENT,
+                                     f"{CAT_ICON.get(rec['category'], '•')} {esc(rec['text'])} — "
+                                     f"<b>{fmt_money(float(rec['amount']))}</b>\n"
+                                     f"👤 {esc(rec['who'])} · {esc(rec['date'][:5])} · расход #{rec['id']}")
+                    if msg:
+                        await run(sheets.get().expense_set, row, msg_id=msg.message_id, notification_status="sent")
+                except Exception:
+                    log.exception("expense #%s: Telegram notification deferred", rec["id"])
+
+
+async def expense_outbox_worker() -> None:
+    while True:
+        _outbox_wakeup.clear()
+        try:
+            await flush_expense_outbox()
+        except Exception:
+            log.exception("expense outbox unavailable; retrying later")
+        try:
+            await asyncio.wait_for(_outbox_wakeup.wait(), timeout=30)
+        except asyncio.TimeoutError:
+            pass
 
 
 async def expense_update(eid: int, **fields) -> bool:
