@@ -227,11 +227,7 @@ async def cmd_need(m: Message, command: CommandObject):
     if not text:
         return await m.reply("Как: /need туалетная бумага  /  /need нет горячей воды")
     type_ = classify(text)
-    nid = await run(sheets.get().need_add, type_, text, who(m))
-    rec = {"id": nid, "type": type_, "text": text, "who": who(m), "created": stamp()}
-    msg = await svc.post(TOPIC_NEEDS, need_line(rec))
-    if msg:
-        await run(sheets.get().need_set_msg, nid, msg.message_id)
+    nid = await svc.add_need(type_, text, who(m))
     if not in_topic(m, TOPIC_NEEDS):
         await m.reply(f"Заявка #{nid} ({type_}) принята, в «Заявках».")
 
@@ -241,15 +237,8 @@ async def cmd_needs(m: Message):
     rows = [r for r in await run(sheets.get().needs) if not str(r.get("closed_at", "")).strip()]
     if not rows:
         return await m.reply("✅ Открытых заявок нет")
-    out = ["📋 <b>Открытые заявки</b>"]
-    for t in TYPE_ORDER:
-        group = [r for r in rows if r.get("type") == t]
-        if not group:
-            continue
-        out.append(f"\n{TYPE_ICON[t]} <b>{t}</b>")
-        out += [f"#{r['id']} {esc(r['text'])} <i>— {esc(r['who'])}, {short(r['created'])}</i>" for r in group]
-    out.append("\nЗакрыть: /done &lt;номер&gt;")
-    await m.reply("\n".join(out))
+    for page in svc.needs_pages(rows):
+        await m.reply(page)
 
 
 @router.message(Command("done"))
@@ -257,19 +246,11 @@ async def cmd_done(m: Message, command: CommandObject):
     arg = (command.args or "").strip().lstrip("#")
     if not arg.isdigit():
         return await m.reply("Как: /done 14")
-    rec = await run(sheets.get().need_close, int(arg), who(m))
+    rec = await svc.need_close(int(arg), who(m), strict_summary=False)
     if rec is None:
         return await m.reply(f"Заявки #{arg} нет.")
     if rec["already"]:
         return await m.reply(f"#{arg} уже закрыта ({esc(rec['closed_by'])}, {esc(rec['closed_at'])}).")
-    if rec.get("msg_id"):
-        try:
-            await svc.bot.edit_message_text(
-                need_line(rec, closed=True), chat_id=GROUP_ID, message_id=int(rec["msg_id"])
-            )
-        except Exception as e:  # пост могли удалить / старше 48ч
-            log.warning("edit failed for #%s: %s", arg, e)
-            await svc.post(TOPIC_NEEDS, need_line(rec, closed=True))
     await m.reply(f"✅ #{arg} закрыта.")
 
 
@@ -291,12 +272,7 @@ async def close_need_from_text(text: str, who_: str, eid: int) -> str:
     nm = NEED_RE.search(text)
     if not nm:
         return ""
-    rec = await run(sheets.get().need_close, int(nm.group(1)), who_)
-    if rec and not rec["already"] and rec.get("msg_id"):
-        try:
-            await svc.bot.edit_message_text(need_line(rec, closed=True), chat_id=GROUP_ID, message_id=int(rec["msg_id"]))
-        except Exception:
-            pass
+    await svc.need_close(int(nm.group(1)), who_, strict_summary=False)
     return nm.group(1)
 
 

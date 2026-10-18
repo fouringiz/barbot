@@ -28,6 +28,7 @@ class Sheets:
         "stoplist": ["item", "since", "who", "note"],
         "needs": ["id", "type", "text", "who", "created", "closed_by", "closed_at", "msg_id"],
         "expenses": EXP_COLS,
+        "state": ["key", "value"],
     }
 
     def _ensure_sheets(self):
@@ -125,6 +126,21 @@ class Sheets:
         ws.update_cell(cell.row, 7, rec["closed_at"])
         rec["already"] = False
         return rec
+
+    def summary_id(self, key: str) -> int | None:
+        ws = self.ws("state")
+        for rec in ws.get_all_records():
+            if str(rec.get("key", "")) == key and str(rec.get("value", "")).isdigit():
+                return int(rec["value"])
+        return None
+
+    def set_summary_id(self, key: str, msg_id: int) -> None:
+        ws = self.ws("state")
+        for row, rec in enumerate(ws.get_all_records(), start=2):
+            if str(rec.get("key", "")) == key:
+                ws.update_cell(row, 2, msg_id)
+                return
+        ws.append_row([key, msg_id])
 
 
     # --- expenses

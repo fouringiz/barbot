@@ -22,6 +22,11 @@ async def main() -> None:
     await asyncio.to_thread(sheets.get)
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     svc.set_bot(bot)
+    try:
+        async with svc._needs_lock:
+            await svc.refresh_needs_summary()
+    except Exception:
+        log.exception("startup needs summary refresh failed; will retry after the next need change")
 
     dp = Dispatcher()
     dp.include_router(team.router)
