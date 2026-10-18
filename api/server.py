@@ -7,7 +7,8 @@ from uuid import UUID
 from aiohttp import web
 
 import services as svc
-from sheets import ExpenseConflict
+import sheets
+from sheets import ExpenseConflict, run
 from api.auth import auth
 from classify import CAT_ICON, TYPE_ICON, classify
 from config import PORT, WEB_ORIGIN
@@ -111,8 +112,12 @@ async def expenses_patch(request: web.Request) -> web.Response:
 
 
 async def expenses_delete(request: web.Request) -> web.Response:
-    ok = await svc.expense_delete(int(request.match_info["id"]), _who(request), "app")
-    return web.json_response({"ok": ok}, status=200 if ok else 404)
+    eid = int(request.match_info["id"])
+    found = await run(sheets.get().expense_by_id, eid)
+    if not found:
+        return web.json_response({"ok": False}, status=404)
+    done = await svc.expense_mark_deleted(found[0], found[1], _who(request), "app", notify=True)
+    return web.json_response({"ok": True, "already": not done, "deleted_by": svc.deleted_by(found[1]) if not done else _who(request)})
 
 
 def _json_object(body):

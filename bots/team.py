@@ -20,7 +20,7 @@ from classify import NEED_RE, TYPE_ICON, classify, exp_category, is_dismiss, par
 from config import APP_LINK, CLOSE_HOUR, CLOSE_MIN, GROUP_ID, TOPIC_NEEDS, TOPIC_SPENT, TOPIC_STOP
 from sheets import run
 from specs import card, find_spec, spec_names, spec_parts, tok_match
-from utils import esc, fmt_money, norm, now, parse_stamp, ru_day, short, stamp, RU_MONTHS
+from utils import esc, fmt_money, norm, now, parse_stamp, ru_day, short, RU_MONTHS
 
 log = logging.getLogger("barbot.team")
 router = Router(name="team")
@@ -322,7 +322,7 @@ async def spent_new(m: Message):
             if amt is not None:                           # подпись пришла на этом фото — дописываем первую запись
                 found = await run(sheets.get().expense_by_msg, first)
                 if found and not str(found[1].get("amount", "")).strip():
-                    await run(sheets.get().expense_set, found[0], amount=amt, text=text, category=exp_category(text))
+                    await svc.expense_amend(found[0], found[1], who(m), "topic", amount=amt, text=text)
                     await react(m, "✅")
             return
         MEDIA_GROUPS[m.media_group_id] = m.message_id
@@ -399,27 +399,27 @@ async def cmd_spent(m: Message):
 
 
 async def job_daily_spent():
-    rows = svc.live_expenses(await run(sheets.get().expenses))
+    all_rows = await run(sheets.get().expenses)
+    rows = svc.live_expenses([dict(r) for r in all_rows])
     n = now()
-    day = svc.between(rows, n - timedelta(days=1), n)
-    if not day:
+    a = n - timedelta(days=1)
+    day = svc.between(rows, a, n)
+    gone = svc.deleted_between(all_rows, a, n)
+    if not day and not gone:
         return
-    month = svc.between(rows, n.replace(day=1, hour=0, minute=0, second=0, microsecond=0), n)
+    month = svc.between(rows, *svc.period_bounds("month"))
     label = ru_day(n - timedelta(hours=CLOSE_HOUR + 1))
     lines = [f"💸 <b>Итог дня · {label}</b>",
              f"{fmt_money(sum(r['_amt'] for r in day))} · {len(day)} зап.", svc.by_category_text(day), ""]
     lines += [f"• {esc(r['text'])} — {fmt_money(r['_amt'])} <i>({esc(r['who'])})</i>" for r in day]
-    all_rows = await run(sheets.get().expenses)
     pending = [r for r in all_rows if not str(r.get("amount", "")).strip() and not str(r.get("deleted", "")).strip()]
-    today = short(stamp())[:5]
-    gone = [r for r in all_rows if today in str(r.get("deleted", ""))]
-    if gone:
-        lines += ["", "🗑 Удалено за день: " + ", ".join(f"#{r['id']} ({esc(str(r['deleted']).split(' · ')[0])})" for r in gone)]
     if pending:
         lines += ["", f"❓ Без суммы: {len(pending)} — ответьте числом на эти записи"]
     nodesc = [r for r in day if r.get("category") == "без описания"]
     if nodesc:
         lines += [f"❔ Без описания: {len(nodesc)} — отредактируйте, добавьте что куплено"]
+    if gone:
+        lines += ["", "🗑 Удалено за день: " + ", ".join(f"#{r['id']} ({esc(svc.deleted_by(r) or '?')})" for r in gone)]
     lines += ["", f"За месяц: <b>{fmt_money(sum(r['_amt'] for r in month))}</b>"]
     await svc.post(TOPIC_SPENT, "\n".join(lines))
 

@@ -443,7 +443,34 @@ def _exp_desc(rec: dict) -> str:
         amt = fmt_money(float(str(rec.get("amount", "")).replace(",", ".")))
     except ValueError:
         amt = str(rec.get("amount", ""))
-    return f"{rec.get('text', '')} — {amt}"
+    cat = rec.get("category", "")
+    return f"{rec.get('text', '')} — {amt}" + (f" ({cat})" if cat else "")
+
+
+async def _notify(text: str) -> None:
+    """Уведомление в «Расходы» — best effort: запись уже сохранена, сбой Telegram её не отменяет."""
+    try:
+        await post(TOPIC_SPENT, text)
+    except Exception:
+        log.exception("notification deferred to audit log only: %s", text[:80])
+
+
+def deleted_between(rows: list[dict], a: datetime, b: datetime) -> list[dict]:
+    """Удалённые записи, чья отметка «кто · когда» попадает в интервал."""
+    out = []
+    for r in rows:
+        mark = str(r.get("deleted", "")).strip()
+        if not mark:
+            continue
+        dt = parse_stamp(mark.split(" · ")[-1])
+        if dt and a <= dt < b:
+            out.append(r)
+    return out
+
+
+def deleted_by(rec: dict) -> str:
+    mark = str(rec.get("deleted", "")).strip()
+    return mark.split(" · ")[0] if " · " in mark else ""
 
 
 async def expense_amend(row_idx: int, rec: dict, who: str, source: str = "bot", notify: bool = False, **fields) -> None:
@@ -454,15 +481,19 @@ async def expense_amend(row_idx: int, rec: dict, who: str, source: str = "bot", 
     after = dict(rec, **fields)
     await audit(who, "expense_edit", "expense", rec["id"], _exp_desc(rec), _exp_desc(after), source)
     if notify:
-        await post(TOPIC_SPENT, f"✏️ {esc(who)} изменил расход #{rec['id']}: {esc(_exp_desc(rec))} → {esc(_exp_desc(after))}")
+        await _notify(f"✏️ {esc(who)} изменил расход #{rec['id']}: {esc(_exp_desc(rec))} → {esc(_exp_desc(after))}")
 
 
-async def expense_mark_deleted(row_idx: int, rec: dict, who: str, source: str = "bot", notify: bool = False) -> None:
-    """Пометить удалённой: в колонке deleted — кто и когда; журнал; при удалении из приложения — пост в топик."""
-    await run(sheets.get().expense_set, row_idx, deleted=f"{who} · {short(stamp())}")
+async def expense_mark_deleted(row_idx: int, rec: dict, who: str, source: str = "bot", notify: bool = False) -> bool:
+    """Пометить удалённой: в колонке deleted — кто и когда; журнал; при удалении из приложения — пост в топик.
+    Уже удалённая запись не трогается — первый автор остаётся. Возвращает False, если уже была удалена."""
+    if str(rec.get("deleted", "")).strip():
+        return False
+    await run(sheets.get().expense_set, row_idx, deleted=f"{who} · {stamp()}")
     await audit(who, "expense_delete", "expense", rec["id"], _exp_desc(rec), "", source)
     if notify:
-        await post(TOPIC_SPENT, f"🗑 {esc(who)} удалил расход #{rec['id']} — {esc(_exp_desc(rec))}")
+        await _notify(f"🗑 {esc(who)} удалил расход #{rec['id']} — {esc(_exp_desc(rec))}")
+    return True
 
 
 async def expense_update(eid: int, who: str = "", source: str = "bot", **fields) -> bool:
