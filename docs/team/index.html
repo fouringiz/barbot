@@ -99,6 +99,8 @@
   .save-notice{padding:12px 14px;border-radius:12px;background:var(--gold-bg);color:var(--gold-ink);font-size:13px;line-height:1.5;margin:0 0 12px}
   .resume{width:100%;margin-top:14px;height:50px}
   .delivery{font-size:12px;color:var(--gold-ink);margin-top:2px}
+  .log{padding:10px 14px;border-radius:12px;background:var(--card);border:1px solid var(--line);font-size:13px;line-height:1.4}
+  .log b{font-weight:700}.log .when{color:var(--muted);font-size:12px}
   .toast{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(100px + env(safe-area-inset-bottom,0px));background:var(--ink);color:var(--dark-text);padding:10px 16px;border-radius:12px;font-size:14px;font-weight:600;opacity:0;transition:opacity .2s;pointer-events:none;max-width:90vw;text-align:center}
   .toast.show{opacity:1}
   .gate{padding:60px 24px;text-align:center}.gate h1{font-size:28px;margin-bottom:10px}.gate p{color:var(--muted);line-height:1.5}
@@ -132,6 +134,8 @@
     <div class="section"><span>Записи</span><small id="pending"></small></div>
     <div class="list" id="exp-list"></div>
     <button class="btn resume" id="resume" hidden>Проверить сохранение покупки</button>
+    <div class="section" style="margin-top:24px"><span>Журнал действий</span><button class="chip" id="audit-toggle">показать</button></div>
+    <div class="list" id="audit-list" hidden></div>
   </section>
 
   <!-- ===== Заявки ===== -->
@@ -352,6 +356,17 @@ async function saveExpense(){
 }
 async function deleteExpense(){ if(!editing||saving) return; try{ await api("/api/expenses/"+editing.id,{method:"DELETE"}); haptic("ok"); hide(); await loadExpenses(); toast("Удалено"); }catch(e){ toast(e.message); } }
 
+/* ---------- audit ---------- */
+const ACT = {expense_add:"добавил расход", expense_edit:"изменил расход", expense_delete:"удалил расход", stop_add:"поставил в стоп", stop_remove:"снял со стопа", need_add:"создал заявку", need_close:"закрыл заявку"};
+async function loadAudit(){
+  const list=$("#audit-list");
+  try{ const d=await api("/api/audit?limit=40");
+    list.innerHTML = d.items.length ? d.items.map(a=>{ const what = a.entity==="stop" ? a.entity_id : "#"+a.entity_id; const det = a.action==="expense_edit" ? `${esc(a.before)} → ${esc(a.after)}` : esc(a.after||a.before);
+      return `<div class="log"><b>${esc(a.who)}</b> ${ACT[a.action]||esc(a.action)} ${esc(what)}${det?" · "+det:""}<div class="when">${esc(String(a.at).slice(0,5))} ${esc(String(a.at).slice(11))} · ${a.source==="app"?"приложение":"Telegram"}</div></div>`; }).join("")
+      : `<div class="empty">Журнал пуст</div>`; }
+  catch(e){ toast(e.message); }
+}
+
 /* ---------- needs ---------- */
 async function loadNeeds(){
   try{
@@ -505,6 +520,7 @@ $$("nav.bottom button").forEach(b=>b.addEventListener("click",()=>{ haptic(); go
 $$("#scr-expenses .tab").forEach(b=>b.addEventListener("click",()=>{ period=b.dataset.period; $$("#scr-expenses .tab").forEach(x=>x.setAttribute("aria-pressed",x===b)); haptic(); loadExpenses(); }));
 $("#fab").addEventListener("click",()=> screen==="expenses" ? openExpense(null) : openNeed());
 $("#resume").addEventListener("click",()=>openExpense(null));
+$("#audit-toggle").addEventListener("click",()=>{ const l=$("#audit-list"); l.hidden=!l.hidden; $("#audit-toggle").textContent=l.hidden?"показать":"скрыть"; if(!l.hidden) loadAudit(); });
 $("#scrim").addEventListener("click",hide); $$("[data-close]").forEach(b=>b.addEventListener("click",hide));
 $("#exp-save").addEventListener("click",saveExpense); $("#exp-delete").addEventListener("click",deleteExpense);
 $("#need-save").addEventListener("click",saveNeed); $("#close-save").addEventListener("click",saveClose);

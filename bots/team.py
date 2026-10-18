@@ -20,7 +20,7 @@ from classify import NEED_RE, TYPE_ICON, classify, exp_category, is_dismiss, par
 from config import APP_LINK, CLOSE_HOUR, CLOSE_MIN, GROUP_ID, TOPIC_NEEDS, TOPIC_SPENT, TOPIC_STOP
 from sheets import run
 from specs import card, find_spec, spec_names, spec_parts, tok_match
-from utils import esc, fmt_money, norm, now, parse_stamp, ru_day, short, RU_MONTHS
+from utils import esc, fmt_money, norm, now, parse_stamp, ru_day, short, stamp, RU_MONTHS
 
 log = logging.getLogger("barbot.team")
 router = Router(name="team")
@@ -292,7 +292,7 @@ async def spent_reply(m: Message):
         return                                           # реплай на разговор или на сводку бота — не запись
     row_idx, rec = found
     if is_dismiss(text):
-        await run(sheets.get().expense_set, row_idx, deleted="да")
+        await svc.expense_mark_deleted(row_idx, rec, who(m), "topic")
         await react(m, "👌")
         if from_bot:                                     # убираем свой вопрос «Сумма?»
             try:
@@ -303,7 +303,7 @@ async def spent_reply(m: Message):
     amt = parse_amount(text)
     if amt is None:
         return await react(m, "❓")
-    await run(sheets.get().expense_set, row_idx, amount=amt)
+    await svc.expense_amend(row_idx, rec, who(m), "topic", amount=amt)
     await react(m, "✅")
     if not from_bot:
         await react(target, "✅")
@@ -330,6 +330,7 @@ async def spent_new(m: Message):
         text = "чек"
     need_id = ""
     eid = await run(sheets.get().expense_add, who(m), amt, text, exp_category(text), "", photo, m.message_id)
+    await svc.audit(who(m), "expense_add", "expense", eid, "", f"{text} — {amt if amt is not None else '?'}", "topic")
     if NEED_RE.search(text):
         need_id = await close_need_from_text(text, who(m), eid)
         if need_id:
@@ -360,7 +361,7 @@ async def spent_edited(m: Message):
         return
     text = (m.text or m.caption or "").strip() or "чек"
     amt = parse_amount(text)
-    await run(sheets.get().expense_set, found[0], text=text, amount=amt if amt is not None else "", category=exp_category(text))
+    await svc.expense_amend(found[0], found[1], who(m), "topic", text=text, amount=amt if amt is not None else "")
     await react(m, "✅" if amt is not None else "❓")
 
 
@@ -371,7 +372,7 @@ async def cmd_del(m: Message):
     found = await run(sheets.get().expense_by_msg, m.reply_to_message.message_id)
     if not found:
         return await m.reply("Это не запись расхода.")
-    await run(sheets.get().expense_set, found[0], deleted="да")
+    await svc.expense_mark_deleted(found[0], found[1], who(m), "topic")
     await react(m.reply_to_message, "👌")
 
 
@@ -408,7 +409,12 @@ async def job_daily_spent():
     lines = [f"💸 <b>Итог дня · {label}</b>",
              f"{fmt_money(sum(r['_amt'] for r in day))} · {len(day)} зап.", svc.by_category_text(day), ""]
     lines += [f"• {esc(r['text'])} — {fmt_money(r['_amt'])} <i>({esc(r['who'])})</i>" for r in day]
-    pending = [r for r in await run(sheets.get().expenses) if not str(r.get("amount", "")).strip() and not str(r.get("deleted", "")).strip()]
+    all_rows = await run(sheets.get().expenses)
+    pending = [r for r in all_rows if not str(r.get("amount", "")).strip() and not str(r.get("deleted", "")).strip()]
+    today = short(stamp())[:5]
+    gone = [r for r in all_rows if today in str(r.get("deleted", ""))]
+    if gone:
+        lines += ["", "🗑 Удалено за день: " + ", ".join(f"#{r['id']} ({esc(str(r['deleted']).split(' · ')[0])})" for r in gone)]
     if pending:
         lines += ["", f"❓ Без суммы: {len(pending)} — ответьте числом на эти записи"]
     nodesc = [r for r in day if r.get("category") == "без описания"]

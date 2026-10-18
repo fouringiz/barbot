@@ -106,12 +106,12 @@ async def expenses_patch(request: web.Request) -> web.Response:
         fields["category"] = body["category"]
     if not fields:
         return web.json_response({"error": "нечего менять"}, status=400)
-    ok = await svc.expense_update(eid, **fields)
+    ok = await svc.expense_update(eid, _who(request), "app", **fields)
     return web.json_response({"ok": ok}, status=200 if ok else 404)
 
 
 async def expenses_delete(request: web.Request) -> web.Response:
-    ok = await svc.expense_delete(int(request.match_info["id"]))
+    ok = await svc.expense_delete(int(request.match_info["id"]), _who(request), "app")
     return web.json_response({"ok": ok}, status=200 if ok else 404)
 
 
@@ -136,9 +136,9 @@ async def stop_post(request: web.Request) -> web.Response:
     if not item or len(item) > 100:
         return web.json_response({"error": "item: от 1 до 100 символов"}, status=400)
     if body.get("on", True):
-        res = await svc.stop_add(item, _who(request))
+        res = await svc.stop_add(item, _who(request), source="app")
         return web.json_response(res or {"item": item, "affected": [], "already": True})
-    ok = await svc.stop_remove(item, _who(request))
+    ok = await svc.stop_remove(item, _who(request), source="app")
     return web.json_response({"ok": ok}, status=200 if ok else 404)
 
 
@@ -160,7 +160,7 @@ async def needs_post(request: web.Request) -> web.Response:
     if type_ is not None and (not isinstance(type_, str) or type_ not in TYPE_ICON):
         return web.json_response({"error": "неизвестный тип"}, status=400)
     type_ = type_ or classify(text)
-    nid = await svc.add_need(type_, text, _who(request))
+    nid = await svc.add_need(type_, text, _who(request), source="app")
     return web.json_response({"id": nid, "type": type_, "text": text, "who": _who(request), "created": short(stamp())},
                              status=201)
 
@@ -175,7 +175,7 @@ async def needs_close(request: web.Request) -> web.Response:
         return web.json_response({"error": "ожидается объект JSON"}, status=400)
     amount = body.get("amount")
     if amount in (None, ""):
-        rec = await svc.need_close(nid, _who(request), strict_summary=False)
+        rec = await svc.need_close(nid, _who(request), strict_summary=False, source="app")
         return web.json_response({"ok": rec is not None, "already": bool(rec and rec.get("already"))},
                                  status=200 if rec is not None else 404)
     try:
@@ -201,6 +201,15 @@ async def needs_close(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "expense": item}, status=201 if created else 200)
 
 
+# --- audit
+async def audit_get(request: web.Request) -> web.Response:
+    try:
+        limit = max(1, min(200, int(request.query.get("limit", "50"))))
+    except ValueError:
+        limit = 50
+    return web.json_response({"items": await svc.audit_tail(limit)})
+
+
 # --- specs
 async def specs_get(_: web.Request) -> web.Response:
     return web.json_response({"items": await svc.specs_all()})
@@ -222,6 +231,7 @@ def make_app() -> web.Application:
     r.add_post("/api/needs", needs_post)
     r.add_post(r"/api/needs/{id:\d+}/close", needs_close)
     r.add_get("/api/specs", specs_get)
+    r.add_get("/api/audit", audit_get)
     r.add_route("OPTIONS", "/api/{tail:.*}", health)
     return app
 
