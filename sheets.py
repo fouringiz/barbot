@@ -116,6 +116,15 @@ class Sheets:
         row += [""] * (len(self.EXP_COLS) - len(row))
         return cell.row, dict(zip(self.EXP_COLS, row))
 
+    def expense_by_id(self, eid: int) -> tuple[int, dict] | None:
+        ws = self.ws("expenses")
+        cell = ws.find(str(eid), in_column=1)
+        if not cell:
+            return None
+        row = ws.row_values(cell.row)
+        row += [""] * (len(self.EXP_COLS) - len(row))
+        return cell.row, dict(zip(self.EXP_COLS, row))
+
     def expense_set(self, row_idx: int, **fields):
         ws = self.ws("expenses")
         for k, v in fields.items():

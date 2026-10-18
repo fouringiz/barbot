@@ -4,20 +4,21 @@ import csv
 import io
 import logging
 import re
-from datetime import datetime, timedelta
+from datetime import timedelta
 from typing import Any, Awaitable, Callable
 
 from aiogram import BaseMiddleware, F, Router
 from aiogram.filters import Command, CommandObject
-from aiogram.types import BotCommand, BufferedInputFile, ErrorEvent, Message, ReactionTypeEmoji
+from aiogram.types import (BotCommand, BufferedInputFile, ErrorEvent, InlineKeyboardButton, InlineKeyboardMarkup, Message,
+                           ReactionTypeEmoji)
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 import services as svc
 import sheets
-from classify import (CAT_ICON, NEED_RE, TYPE_ICON, TYPE_ORDER, classify, exp_category, is_dismiss, need_line,
+from classify import (NEED_RE, TYPE_ICON, TYPE_ORDER, classify, exp_category, is_dismiss, need_line,
                       parse_amount)
-from config import CLOSE_HOUR, CLOSE_MIN, GROUP_ID, TOPIC_NEEDS, TOPIC_SPENT, TOPIC_STOP
+from config import APP_LINK, CLOSE_HOUR, CLOSE_MIN, GROUP_ID, TOPIC_NEEDS, TOPIC_SPENT, TOPIC_STOP
 from sheets import run
 from specs import affected, card, find_spec, spec_names, spec_parts, tok_match
 from utils import esc, fmt_money, norm, now, parse_stamp, ru_day, short, stamp, RU_MONTHS
@@ -34,6 +35,7 @@ COMMANDS = [
     BotCommand(command="needs", description="открытые заявки"),
     BotCommand(command="done", description="закрыть заявку по номеру"),
     BotCommand(command="spent", description="расходы: сегодня / неделя / месяц"),
+    BotCommand(command="app", description="открыть приложение"),
     BotCommand(command="help", description="справка"),
 ]
 
@@ -107,6 +109,14 @@ HELP = (
 @router.message(Command("start", "help"))
 async def cmd_help(m: Message):
     await m.reply(HELP)
+
+
+@router.message(Command("app"))
+async def cmd_app(m: Message):
+    if not APP_LINK:
+        return await m.reply("Приложение ещё не подключено: BotFather → /newapp → URL фронта, затем APP_LINK в переменные.")
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Открыть приложение", url=APP_LINK)]])
+    await m.reply("Расходы, заявки, стоп-лист — в приложении:", reply_markup=kb)
 
 
 @router.message(Command("id"))
@@ -399,50 +409,18 @@ async def cmd_del(m: Message):
     await react(m.reply_to_message, "👌")
 
 
-def _live(rows: list[dict]) -> list[dict]:
-    out = []
-    for r in rows:
-        if str(r.get("deleted", "")).strip():
-            continue
-        try:
-            r["_amt"] = float(str(r.get("amount", "")).replace(",", "."))
-        except ValueError:
-            continue
-        r["_dt"] = parse_stamp(r.get("date", ""))
-        if r["_dt"]:
-            out.append(r)
-    return out
-
-
-def _between(rows, a: datetime, b: datetime):
-    return [r for r in rows if a <= r["_dt"] < b]
-
-
-def _by_cat(rows) -> str:
-    tot: dict[str, float] = {}
-    for r in rows:
-        tot[r.get("category", "прочее")] = tot.get(r.get("category", "прочее"), 0) + r["_amt"]
-    return " · ".join(f"{CAT_ICON.get(c, '•')} {c} {fmt_money(v)}" for c, v in sorted(tot.items(), key=lambda x: -x[1]))
-
-
-def last_close(ref: datetime | None = None) -> datetime:
-    ref = ref or now()
-    c = ref.replace(hour=CLOSE_HOUR, minute=CLOSE_MIN, second=0, microsecond=0)
-    return c if c <= ref else c - timedelta(days=1)
-
-
 async def spent_summary(period: str) -> str:
-    rows = _live(await run(sheets.get().expenses))
+    rows = svc.live_expenses(await run(sheets.get().expenses))
     n = now()
     if period == "day":
-        a, b = last_close(), n
+        a, b = svc.last_close(), n
     elif period == "week":
         a, b = n - timedelta(days=7), n
     else:
         a, b = n.replace(day=1, hour=0, minute=0, second=0, microsecond=0), n
-    sel = _between(rows, a, b)
+    sel = svc.between(rows, a, b)
     total = sum(r["_amt"] for r in sel)
-    return f"{fmt_money(total)} · {len(sel)} зап." + (f"\n{_by_cat(sel)}" if sel else "")
+    return f"{fmt_money(total)} · {len(sel)} зап." + (f"\n{svc.by_category_text(sel)}" if sel else "")
 
 
 @router.message(Command("spent"))
@@ -454,15 +432,15 @@ async def cmd_spent(m: Message):
 
 
 async def job_daily_spent():
-    rows = _live(await run(sheets.get().expenses))
+    rows = svc.live_expenses(await run(sheets.get().expenses))
     n = now()
-    day = _between(rows, n - timedelta(days=1), n)
+    day = svc.between(rows, n - timedelta(days=1), n)
     if not day:
         return
-    month = _between(rows, n.replace(day=1, hour=0, minute=0, second=0, microsecond=0), n)
+    month = svc.between(rows, n.replace(day=1, hour=0, minute=0, second=0, microsecond=0), n)
     label = ru_day(n - timedelta(hours=CLOSE_HOUR + 1))
     lines = [f"💸 <b>Итог дня · {label}</b>",
-             f"{fmt_money(sum(r['_amt'] for r in day))} · {len(day)} зап.", _by_cat(day), ""]
+             f"{fmt_money(sum(r['_amt'] for r in day))} · {len(day)} зап.", svc.by_category_text(day), ""]
     lines += [f"• {esc(r['text'])} — {fmt_money(r['_amt'])} <i>({esc(r['who'])})</i>" for r in day]
     pending = [r for r in await run(sheets.get().expenses) if not str(r.get("amount", "")).strip() and not str(r.get("deleted", "")).strip()]
     if pending:
@@ -475,10 +453,10 @@ async def job_daily_spent():
 
 
 async def job_weekly_spent():
-    rows = _live(await run(sheets.get().expenses))
+    rows = svc.live_expenses(await run(sheets.get().expenses))
     n = now()
-    week = _between(rows, n - timedelta(days=7), n)
-    prev = _between(rows, n - timedelta(days=14), n - timedelta(days=7))
+    week = svc.between(rows, n - timedelta(days=7), n)
+    prev = svc.between(rows, n - timedelta(days=14), n - timedelta(days=7))
     if not week:
         return
     tw, tp = sum(r["_amt"] for r in week), sum(r["_amt"] for r in prev)
@@ -488,7 +466,7 @@ async def job_weekly_spent():
         k = ru_day(r["_dt"])
         days[k] = days.get(k, 0) + r["_amt"]
     top = sorted(week, key=lambda r: -r["_amt"])[:5]
-    lines = [f"📊 <b>Неделя</b>: {fmt_money(tw)} · {len(week)} зап.{delta}", _by_cat(week), ""]
+    lines = [f"📊 <b>Неделя</b>: {fmt_money(tw)} · {len(week)} зап.{delta}", svc.by_category_text(week), ""]
     lines += [f"{k}: {fmt_money(v)}" for k, v in days.items()]
     lines += ["", "<b>Крупные:</b>"] + [f"• {esc(r['text'])} — {fmt_money(r['_amt'])}" for r in top]
     nophoto = [r for r in week if not str(r.get("photo", "")).strip() and r["_amt"] >= 20]
@@ -498,15 +476,15 @@ async def job_weekly_spent():
 
 
 async def job_monthly_spent():
-    rows = _live(await run(sheets.get().expenses))
+    rows = svc.live_expenses(await run(sheets.get().expenses))
     n = now()
     first_this = n.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     first_prev = (first_this - timedelta(days=1)).replace(day=1)
-    month = _between(rows, first_prev, first_this)
+    month = svc.between(rows, first_prev, first_this)
     if not month:
         return
     total = sum(r["_amt"] for r in month)
-    await svc.post(TOPIC_SPENT, f"🗓 <b>{RU_MONTHS[first_prev.month - 1]} {first_prev.year}</b>: {fmt_money(total)} · {len(month)} зап.\n{_by_cat(month)}")
+    await svc.post(TOPIC_SPENT, f"🗓 <b>{RU_MONTHS[first_prev.month - 1]} {first_prev.year}</b>: {fmt_money(total)} · {len(month)} зап.\n{svc.by_category_text(month)}")
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(["date", "who", "amount", "text", "category", "need_id", "photo"])

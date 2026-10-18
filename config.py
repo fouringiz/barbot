@@ -19,3 +19,7 @@ CREDS = json.loads(os.environ["GOOGLE_CREDS_JSON"])
 # HTTP API для Mini App
 PORT = int(os.environ.get("PORT", "8080"))                       # Railway подставляет сам
 WEB_ORIGIN = os.environ.get("WEB_ORIGIN", "")                    # https://<user>.github.io — CORS; пусто = любой
+
+# Mini App
+APP_LINK = os.environ.get("APP_LINK", "")                        # https://t.me/bakiliBarBot/app — после /newapp в BotFather
+DEV_TOKEN = os.environ.get("DEV_TOKEN", "")                      # заголовок X-Dev-Token для теста API без Telegram; пусто = выключено
