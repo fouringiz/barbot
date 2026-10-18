@@ -11,10 +11,10 @@ from aiogram.types import Message
 
 import sheets
 from classify import CAT_ICON, TYPE_ICON, TYPE_ORDER, exp_category, need_line
-from config import CLOSE_HOUR, CLOSE_MIN, GROUP_ID, TOPIC_NEEDS, TOPIC_SPENT
+from config import CLOSE_HOUR, CLOSE_MIN, GROUP_ID, TOPIC_NEEDS, TOPIC_SPENT, TOPIC_STOP
 from sheets import run
-from specs import spec_names, tok_match
-from utils import esc, fmt_money, now, parse_stamp, short, stamp
+from specs import affected, spec_names, spec_parts, tok_match
+from utils import esc, fmt_money, norm, now, parse_stamp, short, stamp
 
 log = logging.getLogger("barbot.services")
 
@@ -70,6 +70,57 @@ async def menu_for_guests() -> list[dict]:
             "garnish": s.get("garnish", ""),
             "tags": [t for t in tags if t.lower() != "меню"],
             "available": spec_available(s, stop),
+        })
+    return out
+
+
+# ---------------------------------------------------------------- stop-list
+async def stop_add(item: str, who: str) -> dict | None:
+    """Поставить в стоп + пост с упавшими коктейлями. None — уже в стопе."""
+    current = [norm(r["item"]) for r in await run(sheets.get().stoplist)]
+    if norm(item) in current:
+        return None
+    await run(sheets.get().stop_add, item, who)
+    hit = affected(await run(sheets.get().specs), item)
+    text = f"⛔ <b>В стопе:</b> {esc(item)} — {esc(who)}, {short(stamp())}"
+    if hit:
+        text += "\nПадают: " + esc(", ".join(hit))
+    await post(TOPIC_STOP, text)
+    return {"item": item, "affected": hit}
+
+
+async def stop_remove(item: str, who: str) -> bool:
+    if not await run(sheets.get().stop_remove, item):
+        return False
+    await post(TOPIC_STOP, f"✅ <b>Снят со стопа:</b> {esc(item)} — {esc(who)}, {short(stamp())}")
+    return True
+
+
+async def stop_state() -> dict:
+    """Для экрана стоп-листа: что в стопе (с упавшими коктейлями) + все ингредиенты карты."""
+    specs = await run(sheets.get().specs)
+    rows = await run(sheets.get().stoplist)
+    names = sorted({n for sp in specs for n in spec_names(sp)})
+    in_stop = [norm(r["item"]) for r in rows]
+    return {
+        "stop": [{"item": r["item"], "since": short(r.get("since", "")), "who": r.get("who", ""),
+                  "affected": affected(specs, r["item"])} for r in rows],
+        "ingredients": [n for n in names if not any(tok_match(st, n) for st in in_stop)],
+    }
+
+
+async def specs_all() -> list[dict]:
+    specs = await run(sheets.get().specs)
+    stop = await stop_items()
+    out = []
+    for sp in specs:
+        names = spec_names(sp)
+        out.append({
+            "name": sp["name"], "aliases": [a.strip() for a in str(sp.get("aliases", "")).split(",") if a.strip()],
+            "ingredients": spec_parts(sp), "method": sp.get("method", ""), "glass": sp.get("glass", ""),
+            "garnish": sp.get("garnish", ""), "pitch": sp.get("pitch", ""),
+            "tags": [t.strip() for t in str(sp.get("tags", "")).split(";") if t.strip()],
+            "dead": [n for n in names if any(tok_match(st, n) for st in stop)],
         })
     return out
 
@@ -217,6 +268,15 @@ async def close_need(nid: int, who: str) -> str:
     """Close a need and refresh its summary; return its id if it exists."""
     rec = await need_close(nid, who, strict_summary=True)
     return str(nid) if rec else ""
+
+
+async def needs_open() -> list[dict]:
+    """Открытые заявки для приложения: по типам в порядке TYPE_ORDER, внутри — новые сверху."""
+    rows = [r for r in await run(sheets.get().needs) if not str(r.get("closed_at", "")).strip()]
+    order = {t: i for i, t in enumerate(TYPE_ORDER)}
+    rows.sort(key=lambda r: (order.get(r.get("type"), 99), -int(r["id"]) if str(r["id"]).isdigit() else 0))
+    return [{"id": int(r["id"]), "type": r.get("type", ""), "text": r.get("text", ""), "who": r.get("who", ""),
+             "created": short(r.get("created", ""))} for r in rows]
 
 
 # ---------------------------------------------------------------- expenses

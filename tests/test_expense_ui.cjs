@@ -21,6 +21,14 @@ function backend() {
     async fetch(url, options) {
       const endpoint = new URL(url).pathname;
       if (endpoint === '/api/me') return response({user:{id:7,first_name:'team'}});
+      if (endpoint === '/api/needs' && (!options.method || options.method === 'GET')) return response({items:[{id:16,type:'бар',text:'Campari',who:'team',created:'18.10 12:00'}],types:[]});
+      if (endpoint === '/api/needs' && options.method === 'POST') { calls.push(options); if (mode === 'hold') await new Promise(resolve => {release=resolve;}); return response({id:17,type:'бар',text:JSON.parse(options.body).text},201); }
+      if (/^\/api\/needs\/\d+\/close$/.test(endpoint)) {
+        calls.push(options);
+        const key=options.headers['Idempotency-Key'];
+        if (key){ if (!records.has(key)) records.set(key,{...JSON.parse(options.body),id:records.size+1}); if (mode === 'lost') throw new TypeError('response lost'); return response({ok:true,expense:records.get(key)},201); }
+        return response({ok:true,already:false});
+      }
       if (options.method === 'POST') {
         calls.push(options);
         if (mode === '400') return response({error:'invalid input'},400);
@@ -56,7 +64,8 @@ async function client(api, storage=new Map(), storageBlocked=false) {
   let timerId=0;
   const sandbox = {
     console,URLSearchParams,AbortController,crypto:{randomUUID},
-    location:{search:'?dev=offline'},window:{},
+    location:{search:'?dev=offline',hash:''},window:{scrollTo(){}},history:{replaceState(){}},
+    setInterval(){return 0;},
     document:{querySelector:element,querySelectorAll:()=>[]},
     localStorage:{
       getItem:key=>storage.get(key) || null,
@@ -68,7 +77,7 @@ async function client(api, storage=new Map(), storageBlocked=false) {
   };
   vm.createContext(sandbox);
   // Remove only automatic boot so tests can await startup deterministically.
-  vm.runInContext(script.replace(/boot\(\);\s*$/, '') + '\nthis.clientAPI={boot,save,openSheet,closeSheet};',sandbox);
+  vm.runInContext(script.replace(/boot\(\);\s*$/, '') + '\nthis.clientAPI={boot,save:saveExpense,openSheet:openExpense,closeSheet:hide,saveNeed,openNeed,openClose,saveClose};',sandbox);
   await sandbox.clientAPI.boot();
   return {
     ...sandbox.clientAPI,element,storage,
@@ -81,24 +90,24 @@ test('double click/Enter submits once and blocks close while saving',async()=>{
   const ui=await client(api);ui.fill();
   const first=ui.save();await ui.save();ui.closeSheet();
   assert.equal(api.calls.length,1);
-  assert.equal(ui.element('#btn-save').disabled,true);
-  assert.equal(ui.element('#sheet').classList.contains('open'),true);
+  assert.equal(ui.element('#exp-save').disabled,true);
+  assert.equal(ui.element('#sheet-exp').classList.contains('open'),true);
   api.release();await first;
   assert.equal(api.records.size,1);
   assert.equal(ui.storage.size,0);
-  assert.equal(ui.element('#toast').textContent,'Расход сохранён');
-  assert.match(ui.element('#list').innerHTML,/уведомление в Telegram ожидает отправки/);
+  assert.equal(ui.element('#toast').textContent,'Записано');
+  assert.match(ui.element('#exp-list').innerHTML,/пост в Telegram в очереди/);
 });
 
 test('lost response retains immutable key/body across closing and reloading',async()=>{
   const api=backend();api.mode='lost';
   let ui=await client(api);ui.fill();await ui.save();
   assert.equal(api.records.size,1);
-  assert.equal(ui.element('#btn-save').textContent,'Проверить сохранение');
+  assert.equal(ui.element('#exp-save').textContent,'Проверить сохранение');
   assert.equal(ui.element('#f-amount').disabled,true);
   ui.closeSheet();assert.equal(ui.element('#resume').hidden,false);
   ui=await client(api,ui.storage);
-  assert.equal(ui.element('#sheet').classList.contains('open'),true);
+  assert.equal(ui.element('#sheet-exp').classList.contains('open'),true);
   assert.equal(ui.element('#f-text').value,'Лаймы, 2 кг');
   api.mode='ok';await ui.save();
   assert.equal(api.records.size,1);
@@ -131,7 +140,7 @@ test('validation failure unlocks the form without leaving an uncertain request',
 test('storage failure prevents a request that cannot be safely replayed',async()=>{
   const api=backend(),ui=await client(api,new Map(),true);ui.fill();await ui.save();
   assert.equal(api.calls.length,0);
-  assert.match(ui.element('#toast').textContent,/Разреши хранилище/);
+  assert.match(ui.element('#toast').textContent,/разреши хранилище/);
 });
 
 test('invalid amount and need number never submit',async()=>{
@@ -147,4 +156,43 @@ test('editing retains its success message',async()=>{
   await ui.save();
   assert.equal(ui.element('#toast').textContent,'Сохранено');
   assert.equal(api.calls.length,0);
+});
+
+test('close-with-expense: lost response keeps one key across reopen and reload',async()=>{
+  const api=backend();api.mode='lost';
+  let ui=await client(api);
+  await ui.openClose({id:16,text:'Campari'},'spend');
+  ui.element('#c-amount').value='64';ui.element('#c-text').value='Campari 2 бут';
+  await ui.saveClose();
+  assert.equal(api.records.size,1);
+  assert.equal(ui.element('#close-save').textContent,'Проверить сохранение');
+  ui.closeSheet();
+  await ui.openClose({id:16,text:'Campari'},'spend');        // переоткрыли форму — ключ тот же
+  await ui.saveClose();
+  ui=await client(api,ui.storage);                           // перезагрузка — черновик восстановлен
+  assert.equal(ui.element('#sheet-close').classList.contains('open'),true);
+  api.mode='ok';await ui.saveClose();
+  const keys=api.calls.map(c=>c.headers['Idempotency-Key']);
+  assert.equal(new Set(keys).size,1);
+  assert.equal(api.records.size,1);
+  assert.equal(ui.storage.size,0);
+});
+
+test('close-with-expense: another need while a close is pending redirects to the pending one',async()=>{
+  const api=backend();api.mode='lost';
+  const ui=await client(api);
+  await ui.openClose({id:16,text:'Campari'},'spend');
+  ui.element('#c-amount').value='64';ui.element('#c-text').value='Campari';await ui.saveClose();
+  ui.closeSheet();
+  await ui.openClose({id:99,text:'Другая'},'spend');
+  assert.equal(ui.element('#close-title').textContent,'Заявка #16');
+});
+
+test('double Enter on new need submits once',async()=>{
+  const api=backend();api.mode='hold';
+  const ui=await client(api);ui.openNeed();ui.element('#n-text').value='нет льда';
+  const first=ui.saveNeed();await ui.saveNeed();await ui.saveNeed();
+  assert.equal(api.calls.length,1);
+  api.release();await first;
+  assert.equal(ui.element('#toast').textContent,'Заявка #17 · бар');
 });
