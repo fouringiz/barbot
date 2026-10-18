@@ -22,6 +22,7 @@ bot: Bot | None = None   # выставляет main.py после создан�
 _outbox_wakeup = asyncio.Event()
 _outbox_lock = asyncio.Lock()
 _needs_lock = asyncio.Lock()
+_expense_mutate_lock = asyncio.Lock()   # перечитать → проверить → записать: правки и удаления расходов атомарны в процессе
 
 
 def set_bot(b: Bot) -> None:
@@ -473,24 +474,40 @@ def deleted_by(rec: dict) -> str:
     return mark.split(" · ")[0] if " · " in mark else ""
 
 
-async def expense_amend(row_idx: int, rec: dict, who: str, source: str = "bot", notify: bool = False, **fields) -> None:
-    """Правка существующей записи (по строке) + журнал + при необходимости пост в «Расходы»."""
+async def expense_amend(row_idx: int, rec: dict, who: str, source: str = "bot", notify: bool = False, **fields) -> bool:
+    """Правка существующей записи + журнал + при необходимости пост в «Расходы».
+    Под блокировкой строка перечитывается: `before` в журнале — актуальное состояние, не то, что видел вызывающий.
+    Удалённую запись не правим. Возвращает False, если записи нет или она удалена."""
     if "text" in fields and "category" not in fields:
         fields["category"] = exp_category(fields["text"])
-    await run(sheets.get().expense_set, row_idx, **fields)
-    after = dict(rec, **fields)
-    await audit(who, "expense_edit", "expense", rec["id"], _exp_desc(rec), _exp_desc(after), source)
+    async with _expense_mutate_lock:
+        found = await run(sheets.get().expense_by_id, int(rec["id"]))
+        if not found:
+            return False
+        row_idx, rec = found
+        if str(rec.get("deleted", "")).strip():
+            return False
+        await run(sheets.get().expense_set, row_idx, **fields)
+        after = dict(rec, **fields)
+        await audit(who, "expense_edit", "expense", rec["id"], _exp_desc(rec), _exp_desc(after), source)
     if notify:
         await _notify(f"✏️ {esc(who)} изменил расход #{rec['id']}: {esc(_exp_desc(rec))} → {esc(_exp_desc(after))}")
+    return True
 
 
 async def expense_mark_deleted(row_idx: int, rec: dict, who: str, source: str = "bot", notify: bool = False) -> bool:
     """Пометить удалённой: в колонке deleted — кто и когда; журнал; при удалении из приложения — пост в топик.
-    Уже удалённая запись не трогается — первый автор остаётся. Возвращает False, если уже была удалена."""
-    if str(rec.get("deleted", "")).strip():
-        return False
-    await run(sheets.get().expense_set, row_idx, deleted=f"{who} · {stamp()}")
-    await audit(who, "expense_delete", "expense", rec["id"], _exp_desc(rec), "", source)
+    Перечитывание и отметка — под одной блокировкой, поэтому из двух одновременных удалений побеждает первое:
+    автор не подменяется, событие в журнале одно. Возвращает False, если уже была удалена."""
+    async with _expense_mutate_lock:
+        found = await run(sheets.get().expense_by_id, int(rec["id"]))
+        if not found:
+            return False
+        row_idx, rec = found
+        if str(rec.get("deleted", "")).strip():
+            return False
+        await run(sheets.get().expense_set, row_idx, deleted=f"{who} · {stamp()}")
+        await audit(who, "expense_delete", "expense", rec["id"], _exp_desc(rec), "", source)
     if notify:
         await _notify(f"🗑 {esc(who)} удалил расход #{rec['id']} — {esc(_exp_desc(rec))}")
     return True
@@ -500,8 +517,7 @@ async def expense_update(eid: int, who: str = "", source: str = "bot", **fields)
     found = await run(sheets.get().expense_by_id, eid)
     if not found:
         return False
-    await expense_amend(found[0], found[1], who or "команда", source, notify=source == "app", **fields)
-    return True
+    return await expense_amend(found[0], found[1], who or "команда", source, notify=source == "app", **fields)
 
 
 async def expense_delete(eid: int, who: str = "", source: str = "bot") -> bool:

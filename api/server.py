@@ -117,7 +117,8 @@ async def expenses_delete(request: web.Request) -> web.Response:
     if not found:
         return web.json_response({"ok": False}, status=404)
     done = await svc.expense_mark_deleted(found[0], found[1], _who(request), "app", notify=True)
-    return web.json_response({"ok": True, "already": not done, "deleted_by": svc.deleted_by(found[1]) if not done else _who(request)})
+    found = await run(sheets.get().expense_by_id, eid)                 # актуальный автор отметки, не тот, что видели до блокировки
+    return web.json_response({"ok": True, "already": not done, "deleted_by": svc.deleted_by(found[1]) if found else ""})
 
 
 def _json_object(body):

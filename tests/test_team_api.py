@@ -103,7 +103,7 @@ class TeamApiTests(unittest.IsolatedAsyncioTestCase):
                                    edit_message_text=AsyncMock())
         for target, value in [("sheets._sh", self.store), ("services.bot", self.bot), ("services.GROUP_ID", -1001),
                               ("services._outbox_lock", asyncio.Lock()), ("services._outbox_wakeup", asyncio.Event()),
-                              ("services._needs_lock", asyncio.Lock())]:
+                              ("services._needs_lock", asyncio.Lock()), ("services._expense_mutate_lock", asyncio.Lock())]:
             p = patch(target, value)
             p.start()
             self.addCleanup(p.stop)
@@ -223,6 +223,38 @@ class TeamApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(rec["deleted"].startswith("team · "))
         self.assertEqual([a["action"] for a in self.store.audit].count("expense_delete"), 1)
         self.assertEqual(sum("🗑" in c.args[1] for c in self.bot.send_message.await_args_list), 1)
+
+    async def test_concurrent_deletes_keep_one_author_and_one_event(self):
+        key = str(uuid4())
+        _, item = await self.call(server.expenses_post, "POST", "/api/expenses", {"amount": "5", "text": "мята"},
+                                  headers={"Idempotency-Key": key})
+        eid = item["id"]
+
+        async def delete_as(uid, name):
+            req = make_mocked_request("DELETE", f"/api/expenses/{eid}", match_info={"id": str(eid)})
+            req["user"] = {"id": uid, "first_name": name}
+            return json.loads((await server.expenses_delete(req)).text)
+
+        results = await asyncio.gather(delete_as(1, "Аня"), delete_as(2, "Борис"), delete_as(3, "Вова"))
+        self.assertEqual(sorted(r["already"] for r in results), [False, True, True])
+        winner = next(r for r in results if not r["already"])["deleted_by"]
+        _, rec = self.store.exp.expense_by_id(eid)
+        self.assertTrue(rec["deleted"].startswith(winner + " · "))
+        self.assertTrue(all(r["deleted_by"] == winner for r in results))
+        self.assertEqual([a["action"] for a in self.store.audit].count("expense_delete"), 1)
+        self.assertEqual(sum("🗑" in c.args[1] for c in self.bot.send_message.await_args_list), 1)
+
+    async def test_edit_of_deleted_record_is_rejected(self):
+        key = str(uuid4())
+        _, item = await self.call(server.expenses_post, "POST", "/api/expenses", {"amount": "5", "text": "мята"},
+                                  headers={"Idempotency-Key": key})
+        await self.call(server.expenses_delete, "DELETE", f"/api/expenses/{item['id']}", match_info={"id": str(item["id"])})
+        status, _ = await self.call(server.expenses_patch, "PATCH", f"/api/expenses/{item['id']}", {"amount": "9"},
+                                    match_info={"id": str(item["id"])})
+        self.assertEqual(status, 404)
+        _, rec = self.store.exp.expense_by_id(item["id"])
+        self.assertEqual(rec["amount"], 5)
+        self.assertNotIn("expense_edit", [a["action"] for a in self.store.audit])
 
     async def test_telegram_failure_does_not_fail_edit_or_delete(self):
         key = str(uuid4())
