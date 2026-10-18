@@ -617,6 +617,15 @@ PROMPTS: dict[int, int] = {}        # msg_id вопроса «Сумма?» -> m
 MEDIA_GROUPS: dict[str, int] = {}   # media_group_id альбома -> msg_id первой записи
 
 
+DISMISS_WORDS = ("❌", "x", "х", "-", "удали", "удоли", "удалить", "проигнорь", "проигнорируй", "игнор", "пропусти", "пропустить",
+                 "не чек", "не расход", "не надо", "не нужно", "забей", "отмена", "отмени", "skip", "ignore", "мимо")
+
+
+def is_dismiss(text: str) -> bool:
+    t = norm(text).strip(".!, ")
+    return bool(t) and (t in DISMISS_WORDS or any(t.startswith(w) for w in DISMISS_WORDS if len(w) > 2))
+
+
 def is_spent_topic(m: Message) -> bool:
     return bool(TOPIC_SPENT) and m.chat.id == GROUP_ID and m.is_topic_message and m.message_thread_id == TOPIC_SPENT
 
@@ -638,9 +647,15 @@ async def spent_reply(m: Message):
     if not found:
         return                                           # реплай на разговор или на сводку бота — не запись
     row_idx, rec = found
-    if text in ("❌", "x", "х", "-", "удали", "удалить"):
+    if is_dismiss(text):
         await run(sh.expense_set, row_idx, deleted="да")
-        return await react(m, "👌")
+        await react(m, "👌")
+        if from_bot:                                     # убираем свой вопрос «Сумма?»
+            try:
+                await target.delete()
+            except Exception:
+                pass
+        return
     amt = parse_amount(text)
     if amt is None:
         return await react(m, "❓")
