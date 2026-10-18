@@ -6,31 +6,44 @@ on:
 
 jobs:
   notify:
-    if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     steps:
-      - name: Post merged PR to the «Обновления» topic
+      - name: Post push to main into the «Обновления» topic
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           GROUP_ID: ${{ secrets.TG_GROUP_ID }}
           TOPIC_ID: ${{ secrets.TG_TOPIC_CHANGELOG }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_TITLE: ${{ github.event.pull_request.title }}
-          PR_BODY: ${{ github.event.pull_request.body }}
-          PR_URL: ${{ github.event.pull_request.html_url }}
-          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
-          PR_FILES: ${{ github.event.pull_request.changed_files }}
+          HEAD_MESSAGE: ${{ github.event.head_commit.message }}
+          HEAD_URL: ${{ github.event.head_commit.url }}
+          HEAD_AUTHOR: ${{ github.event.head_commit.author.name }}
+          COMPARE_URL: ${{ github.event.compare }}
+          COMMITS_JSON: ${{ toJson(github.event.commits) }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
         run: |
           python3 - <<'PY'
           import html, json, os, re, urllib.request
 
           esc = lambda s: html.escape(s or "")
-          title = os.environ["PR_TITLE"].strip()
-          body = (os.environ.get("PR_BODY") or "").strip()
+          message = (os.environ.get("HEAD_MESSAGE") or "").strip()
+          commits = json.loads(os.environ.get("COMMITS_JSON") or "[]")
+          if not message:
+              raise SystemExit("empty head commit, nothing to post")
 
-          # markdown-список → маркеры, заголовки/жирный убираем, обрезаем до разумной длины
+          first, _, rest = message.partition("\n")
+          m = re.search(r"\(#(\d+)\)\s*$", first)
+          pr_number = m.group(1) if m else ""
+          title = re.sub(r"\s*\(#\d+\)\s*$", "", first)
+
+          kind = "🆕"
+          if title.startswith("fix"):
+              kind = "🛠"
+          elif title.startswith(("chore", "refactor", "docs", "ci")):
+              kind = "🧹"
+          clean_title = re.sub(r"^\w+(\([^)]*\))?!?:\s*", "", title)
+
+          # тело: markdown-список → маркеры, заголовки убираем, обрезаем
           lines = []
-          for raw in body.splitlines():
+          for raw in rest.splitlines():
               line = raw.rstrip()
               if not line or line.startswith("#"):
                   continue
@@ -42,18 +55,15 @@ jobs:
           if len(summary) > 1500:
               summary = summary[:1490].rstrip() + "…"
 
-          kind = "🆕"
-          if title.startswith("fix"):
-              kind = "🛠"
-          elif title.startswith(("chore", "refactor", "docs")):
-              kind = "🧹"
-          clean_title = re.sub(r"^\w+(\([^)]*\))?:\s*", "", title)
+          link = f"{os.environ['REPO_URL']}/pull/{pr_number}" if pr_number else os.environ["HEAD_URL"]
+          link_label = f"PR #{pr_number}" if pr_number else "коммит"
+          extra = f" · коммитов: {len(commits)}" if len(commits) > 1 else ""
 
           text = (
               f"{kind} <b>{esc(clean_title)}</b>\n"
-              f"<i>PR #{os.environ['PR_NUMBER']} · {esc(os.environ['PR_AUTHOR'])} · файлов: {os.environ['PR_FILES']}</i>\n\n"
+              f"<i>{esc(link_label)} · {esc(os.environ['HEAD_AUTHOR'])}{extra}</i>\n\n"
               f"{esc(summary) if summary else '—'}\n\n"
-              f"<a href=\"{esc(os.environ['PR_URL'])}\">Открыть PR</a> · приложение обновится через 2–3 минуты, переоткройте его"
+              f"<a href=\"{esc(link)}\">Открыть {esc(link_label)}</a> · приложение обновится через 2–3 минуты, переоткройте его"
           )
 
           payload = {
