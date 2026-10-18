@@ -29,6 +29,7 @@ class Sheets:
         "needs": ["id", "type", "text", "who", "created", "closed_by", "closed_at", "msg_id"],
         "expenses": EXP_COLS,
         "state": ["key", "value"],
+        "audit": ["at", "who", "action", "entity", "entity_id", "before", "after", "source"],
     }
 
     def _ensure_sheets(self):
@@ -126,6 +127,16 @@ class Sheets:
         ws.update_cell(cell.row, 7, rec["closed_at"])
         rec["already"] = False
         return rec
+
+    def audit_log(self, who: str, action: str, entity: str, entity_id, before: str = "", after: str = "",
+                  source: str = "bot") -> None:
+        """Журнал действий: кто, что, с чем сделал. Пишется отдельной строкой, ничего не меняет."""
+        self.ws("audit").append_row([stamp(), who, action, entity, str(entity_id), str(before)[:500], str(after)[:500], source],
+                                    value_input_option="RAW")
+
+    def audit_tail(self, limit: int = 50) -> list[dict]:
+        rows = self.ws("audit").get_all_records()
+        return list(reversed(rows[-limit:]))
 
     def summary_id(self, key: str) -> int | None:
         ws = self.ws("state")

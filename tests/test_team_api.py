@@ -37,6 +37,14 @@ class FakeStore:
         self.needs_rows = [{"id": 16, "type": "бар", "text": "Campari 2 бутылки", "who": "Чингиз",
                             "created": "18.10.2026 12:00", "closed_by": "", "closed_at": "", "msg_id": "7"}]
         self.state = {}
+        self.audit = []
+
+    def audit_log(self, who, action, entity, entity_id, before="", after="", source="bot"):
+        self.audit.append({"who": who, "action": action, "entity": entity, "entity_id": str(entity_id),
+                           "before": before, "after": after, "source": source})
+
+    def audit_tail(self, limit=50):
+        return list(reversed(self.audit[-limit:]))
 
     # specs / stop
     def specs(self, force=False):
@@ -95,7 +103,7 @@ class TeamApiTests(unittest.IsolatedAsyncioTestCase):
                                    edit_message_text=AsyncMock())
         for target, value in [("sheets._sh", self.store), ("services.bot", self.bot), ("services.GROUP_ID", -1001),
                               ("services._outbox_lock", asyncio.Lock()), ("services._outbox_wakeup", asyncio.Event()),
-                              ("services._needs_lock", asyncio.Lock())]:
+                              ("services._needs_lock", asyncio.Lock()), ("services._expense_mutate_lock", asyncio.Lock())]:
             p = patch(target, value)
             p.start()
             self.addCleanup(p.stop)
@@ -172,6 +180,136 @@ class TeamApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.store.needs_rows[0]["closed_at"])
         _, rec = self.store.exp.expense_by_id(first[1]["expense"]["id"])
         self.assertEqual((rec["need_status"], rec["notification_status"]), ("done", "sent"))
+
+    # --- audit
+    async def test_app_delete_and_edit_are_attributed_and_announced(self):
+        key = str(uuid4())
+        status, item = await self.call(server.expenses_post, "POST", "/api/expenses", {"amount": "12.5", "text": "лаймы"},
+                                       headers={"Idempotency-Key": key})
+        self.assertEqual(status, 201)
+        status, _ = await self.call(server.expenses_patch, "PATCH", f"/api/expenses/{item['id']}", {"amount": "13"},
+                                    match_info={"id": str(item["id"])})
+        self.assertEqual(status, 200)
+        status, _ = await self.call(server.expenses_delete, "DELETE", f"/api/expenses/{item['id']}",
+                                    match_info={"id": str(item["id"])})
+        self.assertEqual(status, 200)
+        _, rec = self.store.exp.expense_by_id(item["id"])
+        self.assertTrue(rec["deleted"].startswith("team · "))                  # кто и когда вместо «да»
+        actions = [(a["action"], a["who"], a["source"]) for a in self.store.audit]
+        self.assertEqual(actions, [("expense_add", "team", "app"), ("expense_edit", "team", "app"),
+                                   ("expense_delete", "team", "app")])
+        self.assertIn("лаймы — 12.50 ₼", self.store.audit[1]["before"])
+        self.assertIn("13 ₼", self.store.audit[1]["after"])
+        posts = [c.args[1] for c in self.bot.send_message.await_args_list]
+        self.assertTrue(any("✏️ team изменил расход" in p for p in posts))
+        self.assertTrue(any("🗑 team удалил расход" in p for p in posts))
+        status, data = await self.call(server.audit_get, "GET", "/api/audit?limit=2")
+        self.assertEqual([a["action"] for a in data["items"]], ["expense_delete", "expense_edit"])
+
+    async def test_repeat_delete_keeps_first_author_and_logs_once(self):
+        key = str(uuid4())
+        _, item = await self.call(server.expenses_post, "POST", "/api/expenses", {"amount": "5", "text": "мята"},
+                                  headers={"Idempotency-Key": key})
+        req_anna = await self.call(server.expenses_delete, "DELETE", f"/api/expenses/{item['id']}",
+                                   match_info={"id": str(item["id"])})
+        self.assertEqual((req_anna[0], req_anna[1]["already"]), (200, False))
+        # второй пользователь повторяет удаление
+        req = make_mocked_request("DELETE", f"/api/expenses/{item['id']}", match_info={"id": str(item["id"])})
+        req["user"] = {"id": 8, "first_name": "Борис"}
+        resp = await server.expenses_delete(req)
+        data = json.loads(resp.text)
+        self.assertEqual((resp.status, data["already"], data["deleted_by"]), (200, True, "team"))
+        _, rec = self.store.exp.expense_by_id(item["id"])
+        self.assertTrue(rec["deleted"].startswith("team · "))
+        self.assertEqual([a["action"] for a in self.store.audit].count("expense_delete"), 1)
+        self.assertEqual(sum("🗑" in c.args[1] for c in self.bot.send_message.await_args_list), 1)
+
+    async def test_concurrent_deletes_keep_one_author_and_one_event(self):
+        key = str(uuid4())
+        _, item = await self.call(server.expenses_post, "POST", "/api/expenses", {"amount": "5", "text": "мята"},
+                                  headers={"Idempotency-Key": key})
+        eid = item["id"]
+
+        async def delete_as(uid, name):
+            req = make_mocked_request("DELETE", f"/api/expenses/{eid}", match_info={"id": str(eid)})
+            req["user"] = {"id": uid, "first_name": name}
+            return json.loads((await server.expenses_delete(req)).text)
+
+        results = await asyncio.gather(delete_as(1, "Аня"), delete_as(2, "Борис"), delete_as(3, "Вова"))
+        self.assertEqual(sorted(r["already"] for r in results), [False, True, True])
+        winner = next(r for r in results if not r["already"])["deleted_by"]
+        _, rec = self.store.exp.expense_by_id(eid)
+        self.assertTrue(rec["deleted"].startswith(winner + " · "))
+        self.assertTrue(all(r["deleted_by"] == winner for r in results))
+        self.assertEqual([a["action"] for a in self.store.audit].count("expense_delete"), 1)
+        self.assertEqual(sum("🗑" in c.args[1] for c in self.bot.send_message.await_args_list), 1)
+
+    async def test_edit_of_deleted_record_is_rejected(self):
+        key = str(uuid4())
+        _, item = await self.call(server.expenses_post, "POST", "/api/expenses", {"amount": "5", "text": "мята"},
+                                  headers={"Idempotency-Key": key})
+        await self.call(server.expenses_delete, "DELETE", f"/api/expenses/{item['id']}", match_info={"id": str(item["id"])})
+        status, _ = await self.call(server.expenses_patch, "PATCH", f"/api/expenses/{item['id']}", {"amount": "9"},
+                                    match_info={"id": str(item["id"])})
+        self.assertEqual(status, 404)
+        _, rec = self.store.exp.expense_by_id(item["id"])
+        self.assertEqual(rec["amount"], 5)
+        self.assertNotIn("expense_edit", [a["action"] for a in self.store.audit])
+
+    async def test_telegram_failure_does_not_fail_edit_or_delete(self):
+        key = str(uuid4())
+        _, item = await self.call(server.expenses_post, "POST", "/api/expenses", {"amount": "5", "text": "мята"},
+                                  headers={"Idempotency-Key": key})
+        self.bot.send_message.side_effect = OSError("Telegram offline")
+        with self.assertLogs("barbot.services", level="ERROR"):
+            status, _ = await self.call(server.expenses_patch, "PATCH", f"/api/expenses/{item['id']}", {"amount": "6"},
+                                        match_info={"id": str(item["id"])})
+        self.assertEqual(status, 200)
+        with self.assertLogs("barbot.services", level="ERROR"):
+            status, data = await self.call(server.expenses_delete, "DELETE", f"/api/expenses/{item['id']}",
+                                           match_info={"id": str(item["id"])})
+        self.assertEqual((status, data["ok"]), (200, True))
+        _, rec = self.store.exp.expense_by_id(item["id"])
+        self.assertEqual(rec["amount"], 6)
+        self.assertTrue(rec["deleted"])
+        self.assertEqual([a["action"] for a in self.store.audit][-2:], ["expense_edit", "expense_delete"])
+
+    async def test_category_change_is_visible_in_audit(self):
+        key = str(uuid4())
+        _, item = await self.call(server.expenses_post, "POST", "/api/expenses", {"amount": "5", "text": "мята"},
+                                  headers={"Idempotency-Key": key})
+        await self.call(server.expenses_patch, "PATCH", f"/api/expenses/{item['id']}", {"category": "прочее"},
+                        match_info={"id": str(item["id"])})
+        a = self.store.audit[-1]
+        self.assertIn("(бар)", a["before"])
+        self.assertIn("(прочее)", a["after"])
+        self.assertNotEqual(a["before"], a["after"])
+
+    def test_deleted_between_uses_full_timestamp(self):
+        from datetime import datetime, timedelta
+        from utils import now
+        n = now()
+        y = (n - timedelta(hours=20)).strftime("%d.%m.%Y %H:%M")        # вчера вечером
+        old = (n - timedelta(days=3)).strftime("%d.%m.%Y %H:%M")
+        rows = [{"id": 1, "deleted": f"Аня · {y}"}, {"id": 2, "deleted": f"Боря · {old}"}, {"id": 3, "deleted": ""}]
+        gone = svc.deleted_between(rows, n - timedelta(days=1), n)
+        self.assertEqual([r["id"] for r in gone], [1])
+        self.assertEqual(svc.deleted_by(rows[0]), "Аня")
+
+    async def test_topic_delete_is_logged_without_extra_post(self):
+        rec, _ = self.store.exp.expense_add_once("Ильхам", 5, "мята", "бар", msg_id=77)
+        row, rec = self.store.exp.expense_by_msg(77)
+        await svc.expense_mark_deleted(row, rec, "Ильхам", "topic")
+        self.assertEqual(self.store.audit[-1]["source"], "topic")
+        self.bot.send_message.assert_not_awaited()
+        self.assertEqual(self.store.exp.expenses()[0]["deleted"].split(" · ")[0], "Ильхам")
+
+    async def test_stop_and_needs_are_logged(self):
+        await self.call(server.stop_post, "POST", "/api/stop", {"item": "кампари", "on": True})
+        await self.call(server.needs_post, "POST", "/api/needs", {"text": "лаймы"})
+        await self.call(server.needs_close, "POST", "/api/needs/16/close", {}, match_info={"id": "16"})
+        self.assertEqual([a["action"] for a in self.store.audit], ["stop_add", "need_add", "need_close"])
+        self.assertTrue(all(a["source"] == "app" for a in self.store.audit))
 
     async def test_close_with_expense_requires_key_and_valid_amount(self):
         status, _ = await self.call(server.needs_close, "POST", "/api/needs/16/close", {"amount": "5", "text": "x"},

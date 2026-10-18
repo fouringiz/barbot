@@ -292,7 +292,7 @@ async def spent_reply(m: Message):
         return                                           # реплай на разговор или на сводку бота — не запись
     row_idx, rec = found
     if is_dismiss(text):
-        await run(sheets.get().expense_set, row_idx, deleted="да")
+        await svc.expense_mark_deleted(row_idx, rec, who(m), "topic")
         await react(m, "👌")
         if from_bot:                                     # убираем свой вопрос «Сумма?»
             try:
@@ -303,7 +303,7 @@ async def spent_reply(m: Message):
     amt = parse_amount(text)
     if amt is None:
         return await react(m, "❓")
-    await run(sheets.get().expense_set, row_idx, amount=amt)
+    await svc.expense_amend(row_idx, rec, who(m), "topic", amount=amt)
     await react(m, "✅")
     if not from_bot:
         await react(target, "✅")
@@ -322,7 +322,7 @@ async def spent_new(m: Message):
             if amt is not None:                           # подпись пришла на этом фото — дописываем первую запись
                 found = await run(sheets.get().expense_by_msg, first)
                 if found and not str(found[1].get("amount", "")).strip():
-                    await run(sheets.get().expense_set, found[0], amount=amt, text=text, category=exp_category(text))
+                    await svc.expense_amend(found[0], found[1], who(m), "topic", amount=amt, text=text)
                     await react(m, "✅")
             return
         MEDIA_GROUPS[m.media_group_id] = m.message_id
@@ -330,6 +330,7 @@ async def spent_new(m: Message):
         text = "чек"
     need_id = ""
     eid = await run(sheets.get().expense_add, who(m), amt, text, exp_category(text), "", photo, m.message_id)
+    await svc.audit(who(m), "expense_add", "expense", eid, "", f"{text} — {amt if amt is not None else '?'}", "topic")
     if NEED_RE.search(text):
         need_id = await close_need_from_text(text, who(m), eid)
         if need_id:
@@ -360,7 +361,7 @@ async def spent_edited(m: Message):
         return
     text = (m.text or m.caption or "").strip() or "чек"
     amt = parse_amount(text)
-    await run(sheets.get().expense_set, found[0], text=text, amount=amt if amt is not None else "", category=exp_category(text))
+    await svc.expense_amend(found[0], found[1], who(m), "topic", text=text, amount=amt if amt is not None else "")
     await react(m, "✅" if amt is not None else "❓")
 
 
@@ -371,7 +372,7 @@ async def cmd_del(m: Message):
     found = await run(sheets.get().expense_by_msg, m.reply_to_message.message_id)
     if not found:
         return await m.reply("Это не запись расхода.")
-    await run(sheets.get().expense_set, found[0], deleted="да")
+    await svc.expense_mark_deleted(found[0], found[1], who(m), "topic")
     await react(m.reply_to_message, "👌")
 
 
@@ -398,22 +399,27 @@ async def cmd_spent(m: Message):
 
 
 async def job_daily_spent():
-    rows = svc.live_expenses(await run(sheets.get().expenses))
+    all_rows = await run(sheets.get().expenses)
+    rows = svc.live_expenses([dict(r) for r in all_rows])
     n = now()
-    day = svc.between(rows, n - timedelta(days=1), n)
-    if not day:
+    a = n - timedelta(days=1)
+    day = svc.between(rows, a, n)
+    gone = svc.deleted_between(all_rows, a, n)
+    if not day and not gone:
         return
-    month = svc.between(rows, n.replace(day=1, hour=0, minute=0, second=0, microsecond=0), n)
+    month = svc.between(rows, *svc.period_bounds("month"))
     label = ru_day(n - timedelta(hours=CLOSE_HOUR + 1))
     lines = [f"💸 <b>Итог дня · {label}</b>",
              f"{fmt_money(sum(r['_amt'] for r in day))} · {len(day)} зап.", svc.by_category_text(day), ""]
     lines += [f"• {esc(r['text'])} — {fmt_money(r['_amt'])} <i>({esc(r['who'])})</i>" for r in day]
-    pending = [r for r in await run(sheets.get().expenses) if not str(r.get("amount", "")).strip() and not str(r.get("deleted", "")).strip()]
+    pending = [r for r in all_rows if not str(r.get("amount", "")).strip() and not str(r.get("deleted", "")).strip()]
     if pending:
         lines += ["", f"❓ Без суммы: {len(pending)} — ответьте числом на эти записи"]
     nodesc = [r for r in day if r.get("category") == "без описания"]
     if nodesc:
         lines += [f"❔ Без описания: {len(nodesc)} — отредактируйте, добавьте что куплено"]
+    if gone:
+        lines += ["", "🗑 Удалено за день: " + ", ".join(f"#{r['id']} ({esc(svc.deleted_by(r) or '?')})" for r in gone)]
     lines += ["", f"За месяц: <b>{fmt_money(sum(r['_amt'] for r in month))}</b>"]
     await svc.post(TOPIC_SPENT, "\n".join(lines))
 

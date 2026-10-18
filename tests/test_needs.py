@@ -30,6 +30,9 @@ class FakeSheets:
         self.rows.append(dict(id=nid, type=type_, text=text, who=who, created="date", closed_at="", msg_id=""))
         return nid
 
+    def audit_log(self, *args, **kwargs):
+        pass
+
     def need_set_msg(self, nid, msg_id):
         next(r for r in self.rows if int(r["id"]) == nid)["msg_id"] = msg_id
 

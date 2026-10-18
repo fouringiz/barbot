@@ -71,6 +71,8 @@ def store(ws=None):
     obj = object.__new__(sheets.Sheets)
     obj._expense_lock = RLock()
     obj.ws = lambda name: ws
+    obj.audit_log = lambda *a, **k: None          # журнал в этих тестах не проверяется
+    obj.audit_tail = lambda limit=50: []
     return obj
 
 

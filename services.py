@@ -22,6 +22,7 @@ bot: Bot | None = None   # выставляет main.py после создан�
 _outbox_wakeup = asyncio.Event()
 _outbox_lock = asyncio.Lock()
 _needs_lock = asyncio.Lock()
+_expense_mutate_lock = asyncio.Lock()   # перечитать → проверить → записать: правки и удаления расходов атомарны в процессе
 
 
 def set_bot(b: Bot) -> None:
@@ -34,6 +35,18 @@ async def post(topic: int | None, text: str) -> Message | None:
         log.warning("GROUP_ID/бот не настроены — пост пропущен: %s", text[:60])
         return None
     return await bot.send_message(GROUP_ID, text, message_thread_id=topic)
+
+
+async def audit(who: str, action: str, entity: str, entity_id, before="", after="", source="bot") -> None:
+    """Запись в журнал; сбой журнала никогда не ломает основное действие."""
+    try:
+        await run(sheets.get().audit_log, who, action, entity, entity_id, before, after, source)
+    except Exception:
+        log.exception("audit failed: %s %s %s", action, entity, entity_id)
+
+
+async def audit_tail(limit: int = 50) -> list[dict]:
+    return await run(sheets.get().audit_tail, limit)
 
 
 async def stop_items() -> list[str]:
@@ -75,12 +88,13 @@ async def menu_for_guests() -> list[dict]:
 
 
 # ---------------------------------------------------------------- stop-list
-async def stop_add(item: str, who: str) -> dict | None:
+async def stop_add(item: str, who: str, source: str = "bot") -> dict | None:
     """Поставить в стоп + пост с упавшими коктейлями. None — уже в стопе."""
     current = [norm(r["item"]) for r in await run(sheets.get().stoplist)]
     if norm(item) in current:
         return None
     await run(sheets.get().stop_add, item, who)
+    await audit(who, "stop_add", "stop", item, "", item, source)
     hit = affected(await run(sheets.get().specs), item)
     text = f"⛔ <b>В стопе:</b> {esc(item)} — {esc(who)}, {short(stamp())}"
     if hit:
@@ -89,9 +103,10 @@ async def stop_add(item: str, who: str) -> dict | None:
     return {"item": item, "affected": hit}
 
 
-async def stop_remove(item: str, who: str) -> bool:
+async def stop_remove(item: str, who: str, source: str = "bot") -> bool:
     if not await run(sheets.get().stop_remove, item):
         return False
+    await audit(who, "stop_remove", "stop", item, item, "", source)
     await post(TOPIC_STOP, f"✅ <b>Снят со стопа:</b> {esc(item)} — {esc(who)}, {short(stamp())}")
     return True
 
@@ -221,9 +236,10 @@ async def refresh_needs_summary() -> None:
         await run(sheets.get().set_summary_id, _summary_key(), msg.message_id)
 
 
-async def add_need(type_: str, text: str, who: str) -> int:
+async def add_need(type_: str, text: str, who: str, source: str = "bot") -> int:
     async with _needs_lock:
         nid = await run(sheets.get().need_add, type_, text, who)
+        await audit(who, "need_add", "need", nid, "", f"{type_}: {text}", source)
         rec = {"id": nid, "type": type_, "text": text, "who": who, "created": stamp()}
         try:
             msg = await post(TOPIC_NEEDS, need_line(rec))
@@ -239,9 +255,11 @@ async def add_need(type_: str, text: str, who: str) -> int:
         return nid
 
 
-async def need_close(nid: int, who: str, *, strict_summary: bool = False) -> dict | None:
+async def need_close(nid: int, who: str, *, strict_summary: bool = False, source: str = "bot") -> dict | None:
     async with _needs_lock:
         rec = await run(sheets.get().need_close, nid, who)
+        if rec and not rec["already"]:
+            await audit(who, "need_close", "need", nid, rec.get("text", ""), "", source)
         if rec and not rec["already"] and rec.get("msg_id"):
             try:
                 await bot.edit_message_text(need_line(rec, closed=True), chat_id=GROUP_ID,
@@ -364,6 +382,8 @@ async def expense_create(who: str, amount: float, text: str, category: str | Non
     fingerprint = hashlib.sha256(payload.encode()).hexdigest()
     rec, created = await run(sheets.get().expense_add_once, who, amount, text, cat, need_id,
                              request_key=request_key, request_hash=fingerprint)
+    if created:
+        await audit(who, "expense_add", "expense", rec["id"], "", f"{text} — {fmt_money(amount)} ({cat})", "app")
     _outbox_wakeup.set()
     return _item(dict(rec, _amt=float(rec["amount"]))), created
 
@@ -419,15 +439,90 @@ async def expense_outbox_worker() -> None:
             pass
 
 
-async def expense_update(eid: int, **fields) -> bool:
-    found = await run(sheets.get().expense_by_id, eid)
-    if not found:
-        return False
+def _exp_desc(rec: dict) -> str:
+    try:
+        amt = fmt_money(float(str(rec.get("amount", "")).replace(",", ".")))
+    except ValueError:
+        amt = str(rec.get("amount", ""))
+    cat = rec.get("category", "")
+    return f"{rec.get('text', '')} — {amt}" + (f" ({cat})" if cat else "")
+
+
+async def _notify(text: str) -> None:
+    """Уведомление в «Расходы» — best effort: запись уже сохранена, сбой Telegram её не отменяет."""
+    try:
+        await post(TOPIC_SPENT, text)
+    except Exception:
+        log.exception("notification deferred to audit log only: %s", text[:80])
+
+
+def deleted_between(rows: list[dict], a: datetime, b: datetime) -> list[dict]:
+    """Удалённые записи, чья отметка «кто · когда» попадает в интервал."""
+    out = []
+    for r in rows:
+        mark = str(r.get("deleted", "")).strip()
+        if not mark:
+            continue
+        dt = parse_stamp(mark.split(" · ")[-1])
+        if dt and a <= dt < b:
+            out.append(r)
+    return out
+
+
+def deleted_by(rec: dict) -> str:
+    mark = str(rec.get("deleted", "")).strip()
+    return mark.split(" · ")[0] if " · " in mark else ""
+
+
+async def expense_amend(row_idx: int, rec: dict, who: str, source: str = "bot", notify: bool = False, **fields) -> bool:
+    """Правка существующей записи + журнал + при необходимости пост в «Расходы».
+    Под блокировкой строка перечитывается: `before` в журнале — актуальное состояние, не то, что видел вызывающий.
+    Удалённую запись не правим. Возвращает False, если записи нет или она удалена."""
     if "text" in fields and "category" not in fields:
         fields["category"] = exp_category(fields["text"])
-    await run(sheets.get().expense_set, found[0], **fields)
+    async with _expense_mutate_lock:
+        found = await run(sheets.get().expense_by_id, int(rec["id"]))
+        if not found:
+            return False
+        row_idx, rec = found
+        if str(rec.get("deleted", "")).strip():
+            return False
+        await run(sheets.get().expense_set, row_idx, **fields)
+        after = dict(rec, **fields)
+        await audit(who, "expense_edit", "expense", rec["id"], _exp_desc(rec), _exp_desc(after), source)
+    if notify:
+        await _notify(f"✏️ {esc(who)} изменил расход #{rec['id']}: {esc(_exp_desc(rec))} → {esc(_exp_desc(after))}")
     return True
 
 
-async def expense_delete(eid: int) -> bool:
-    return await expense_update(eid, deleted="да")
+async def expense_mark_deleted(row_idx: int, rec: dict, who: str, source: str = "bot", notify: bool = False) -> bool:
+    """Пометить удалённой: в колонке deleted — кто и когда; журнал; при удалении из приложения — пост в топик.
+    Перечитывание и отметка — под одной блокировкой, поэтому из двух одновременных удалений побеждает первое:
+    автор не подменяется, событие в журнале одно. Возвращает False, если уже была удалена."""
+    async with _expense_mutate_lock:
+        found = await run(sheets.get().expense_by_id, int(rec["id"]))
+        if not found:
+            return False
+        row_idx, rec = found
+        if str(rec.get("deleted", "")).strip():
+            return False
+        await run(sheets.get().expense_set, row_idx, deleted=f"{who} · {stamp()}")
+        await audit(who, "expense_delete", "expense", rec["id"], _exp_desc(rec), "", source)
+    if notify:
+        await _notify(f"🗑 {esc(who)} удалил расход #{rec['id']} — {esc(_exp_desc(rec))}")
+    return True
+
+
+async def expense_update(eid: int, who: str = "", source: str = "bot", **fields) -> bool:
+    found = await run(sheets.get().expense_by_id, eid)
+    if not found:
+        return False
+    return await expense_amend(found[0], found[1], who or "команда", source, notify=source == "app", **fields)
+
+
+async def expense_delete(eid: int, who: str = "", source: str = "bot") -> bool:
+    found = await run(sheets.get().expense_by_id, eid)
+    if not found:
+        return False
+    await expense_mark_deleted(found[0], found[1], who or "команда", source, notify=source == "app")
+    return True
