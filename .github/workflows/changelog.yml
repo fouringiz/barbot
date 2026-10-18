@@ -1,0 +1,74 @@
+name: Changelog → Telegram
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+jobs:
+  notify:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post merged PR to the «Обновления» topic
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          GROUP_ID: ${{ secrets.TG_GROUP_ID }}
+          TOPIC_ID: ${{ secrets.TG_TOPIC_CHANGELOG }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_FILES: ${{ github.event.pull_request.changed_files }}
+        run: |
+          python3 - <<'PY'
+          import html, json, os, re, urllib.request
+
+          esc = lambda s: html.escape(s or "")
+          title = os.environ["PR_TITLE"].strip()
+          body = (os.environ.get("PR_BODY") or "").strip()
+
+          # markdown-список → маркеры, заголовки/жирный убираем, обрезаем до разумной длины
+          lines = []
+          for raw in body.splitlines():
+              line = raw.rstrip()
+              if not line or line.startswith("#"):
+                  continue
+              line = re.sub(r"^\s*[-*]\s+", "• ", line)
+              line = re.sub(r"`([^`]*)`", r"\1", line)
+              line = re.sub(r"\*\*([^*]*)\*\*", r"\1", line)
+              lines.append(line)
+          summary = "\n".join(lines)
+          if len(summary) > 1500:
+              summary = summary[:1490].rstrip() + "…"
+
+          kind = "🆕"
+          if title.startswith("fix"):
+              kind = "🛠"
+          elif title.startswith(("chore", "refactor", "docs")):
+              kind = "🧹"
+          clean_title = re.sub(r"^\w+(\([^)]*\))?:\s*", "", title)
+
+          text = (
+              f"{kind} <b>{esc(clean_title)}</b>\n"
+              f"<i>PR #{os.environ['PR_NUMBER']} · {esc(os.environ['PR_AUTHOR'])} · файлов: {os.environ['PR_FILES']}</i>\n\n"
+              f"{esc(summary) if summary else '—'}\n\n"
+              f"<a href=\"{esc(os.environ['PR_URL'])}\">Открыть PR</a> · приложение обновится через 2–3 минуты, переоткройте его"
+          )
+
+          payload = {
+              "chat_id": os.environ["GROUP_ID"],
+              "message_thread_id": int(os.environ["TOPIC_ID"]),
+              "text": text,
+              "parse_mode": "HTML",
+              "disable_web_page_preview": True,
+          }
+          req = urllib.request.Request(
+              f"https://api.telegram.org/bot{os.environ['BOT_TOKEN']}/sendMessage",
+              data=json.dumps(payload).encode(),
+              headers={"Content-Type": "application/json"},
+          )
+          with urllib.request.urlopen(req, timeout=30) as resp:
+              print(resp.status, resp.read()[:200])
+          PY
