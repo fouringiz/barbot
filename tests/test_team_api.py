@@ -201,7 +201,7 @@ class TeamApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("лаймы — 12.50 ₼", self.store.audit[1]["before"])
         self.assertIn("13 ₼", self.store.audit[1]["after"])
         posts = [c.args[1] for c in self.bot.send_message.await_args_list]
-        self.assertTrue(any("✏️ team изменил расход" in p for p in posts))
+        self.assertFalse(any("✏️" in p for p in posts))                        # правки в топик не постятся
         self.assertTrue(any("🗑 team удалил расход" in p for p in posts))
         status, data = await self.call(server.audit_get, "GET", "/api/audit?limit=2")
         self.assertEqual([a["action"] for a in data["items"]], ["expense_delete", "expense_edit"])
@@ -261,10 +261,9 @@ class TeamApiTests(unittest.IsolatedAsyncioTestCase):
         _, item = await self.call(server.expenses_post, "POST", "/api/expenses", {"amount": "5", "text": "мята"},
                                   headers={"Idempotency-Key": key})
         self.bot.send_message.side_effect = OSError("Telegram offline")
-        with self.assertLogs("barbot.services", level="ERROR"):
-            status, _ = await self.call(server.expenses_patch, "PATCH", f"/api/expenses/{item['id']}", {"amount": "6"},
-                                        match_info={"id": str(item["id"])})
-        self.assertEqual(status, 200)
+        status, _ = await self.call(server.expenses_patch, "PATCH", f"/api/expenses/{item['id']}", {"amount": "6"},
+                                    match_info={"id": str(item["id"])})
+        self.assertEqual(status, 200)                                        # правка не постит — Telegram не нужен
         with self.assertLogs("barbot.services", level="ERROR"):
             status, data = await self.call(server.expenses_delete, "DELETE", f"/api/expenses/{item['id']}",
                                            match_info={"id": str(item["id"])})
