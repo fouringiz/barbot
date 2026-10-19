@@ -517,7 +517,7 @@ async def expense_update(eid: int, who: str = "", source: str = "bot", **fields)
     found = await run(sheets.get().expense_by_id, eid)
     if not found:
         return False
-    return await expense_amend(found[0], found[1], who or "команда", source, notify=source == "app", **fields)
+    return await expense_amend(found[0], found[1], who or "команда", source, notify=False, **fields)   # правки — только в журнал
 
 
 async def expense_delete(eid: int, who: str = "", source: str = "bot") -> bool:
