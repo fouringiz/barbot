@@ -162,12 +162,13 @@ class Sheets:
         rows = [self._expense_record(headers, row) for row in values[1:]]
         return [r for r in rows if str(r["id"]).strip()]
 
-    def expense_add(self, who, amount, text, category, need_id="", photo="", msg_id="") -> int:
-        rec, _ = self.expense_add_once(who, amount, text, category, need_id, photo, msg_id)
+    def expense_add(self, who, amount, text, category, need_id="", photo="", msg_id="", dedup_msg=True) -> int:
+        rec, _ = self.expense_add_once(who, amount, text, category, need_id, photo, msg_id, dedup_msg=dedup_msg)
         return int(rec["id"])
 
     def expense_add_once(self, who, amount, text, category, need_id="", photo="", msg_id="",
-                         request_key="", request_hash="") -> tuple[dict, bool]:
+                         request_key="", request_hash="", dedup_msg=True) -> tuple[dict, bool]:
+        """dedup_msg=False — несколько строк от одного сообщения (многострочный чек, пересборка после правки)."""
         # All writers (bot and API) share this lock. Deploy exactly one worker.
         # Keep the key and pending work in the SAME append as the expense itself.
         with self._expense_lock:
@@ -177,7 +178,7 @@ class Sheets:
                     if rec.get("request_hash") != request_hash:
                         raise ExpenseConflict("этот запрос уже использован для другой покупки")
                     return rec, False
-                if msg_id and str(rec.get("msg_id", "")) == str(msg_id):
+                if dedup_msg and msg_id and str(rec.get("msg_id", "")) == str(msg_id):
                     return rec, False
             ids = [int(r["id"]) for r in rows if str(r["id"]).isdigit()]
             values = [max(ids, default=0) + 1, stamp(), who, amount if amount is not None else "", text,
@@ -194,6 +195,17 @@ class Sheets:
 
     def expense_by_id(self, eid: int) -> tuple[int, dict] | None:
         return self._expense_find("id", eid)
+
+    def expenses_by_msg(self, msg_id: int) -> list[tuple[int, dict]]:
+        """Все строки, созданные из одного сообщения (многострочный чек даёт несколько записей)."""
+        ws = self.ws("expenses")
+        headers = self._expense_headers(ws)
+        out = []
+        for i, row in enumerate(ws.get_all_values()[1:], start=2):
+            rec = self._expense_record(headers, row)
+            if str(rec.get("msg_id", "")).strip() == str(msg_id):
+                out.append((i, rec))
+        return out
 
     def _expense_find(self, name, value) -> tuple[int, dict] | None:
         ws = self.ws("expenses")

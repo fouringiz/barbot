@@ -16,7 +16,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 import services as svc
 import sheets
-from classify import NEED_RE, TYPE_ICON, classify, exp_category, is_dismiss, parse_amount
+from classify import NEED_RE, TYPE_ICON, classify, exp_category, is_dismiss, parse_amount, split_expense_lines
 from config import APP_LINK, CLOSE_HOUR, CLOSE_MIN, GROUP_ID, TOPIC_NEEDS, TOPIC_SPENT, TOPIC_STOP
 from sheets import run
 from specs import card, find_spec, spec_names, spec_parts, tok_match
@@ -287,12 +287,13 @@ async def spent_reply(m: Message):
         return await spent_new(m)
     target_id = PROMPTS.get(target.message_id, target.message_id)
     from_bot = target.from_user and target.from_user.id == svc.bot.id
-    found = await run(sheets.get().expense_by_msg, target_id)
-    if not found:
+    rows = await run(sheets.get().expenses_by_msg, target_id)
+    if not rows:
         return                                           # реплай на разговор или на сводку бота — не запись
-    row_idx, rec = found
+    row_idx, rec = rows[0]
     if is_dismiss(text):
-        await svc.expense_mark_deleted(row_idx, rec, who(m), "topic")
+        for r_idx, r_rec in rows:                        # многострочный чек — убираем все его записи
+            await svc.expense_mark_deleted(r_idx, r_rec, who(m), "topic")
         await react(m, "👌")
         if from_bot:                                     # убираем свой вопрос «Сумма?»
             try:
@@ -303,6 +304,8 @@ async def spent_reply(m: Message):
     amt = parse_amount(text)
     if amt is None:
         return await react(m, "❓")
+    if len(rows) > 1:
+        return await m.reply("Это несколько записей — отредактируй исходное сообщение, бот пересоберёт.")
     await svc.expense_amend(row_idx, rec, who(m), "topic", amount=amt)
     await react(m, "✅")
     if not from_bot:
@@ -328,6 +331,10 @@ async def spent_new(m: Message):
         MEDIA_GROUPS[m.media_group_id] = m.message_id
     if not text:
         text = "чек"
+    items = split_expense_lines(text)
+    if items:                                             # несколько позиций — по записи на строку
+        await add_expense_lines(m, items, photo)
+        return
     need_id = ""
     eid = await run(sheets.get().expense_add, who(m), amt, text, exp_category(text), "", photo, m.message_id)
     await svc.audit(who(m), "expense_add", "expense", eid, "", f"{text} — {amt if amt is not None else '?'}", "topic")
@@ -343,6 +350,20 @@ async def spent_new(m: Message):
         await react(m, "✅")
 
 
+async def add_expense_lines(m: Message, items: list[tuple[str, float]], photo: str) -> None:
+    """Многострочный чек: одна запись на строку, все с msg_id сообщения; #N закрывает заявку один раз."""
+    need_id = ""
+    full = (m.text or m.caption or "")
+    if NEED_RE.search(full):
+        need_id = await close_need_from_text(full, who(m), 0)
+    for line, amt in items:
+        clean = NEED_RE.sub("", line).strip(" -–—:")
+        eid = await run(sheets.get().expense_add, who(m), amt, clean, exp_category(clean), need_id, photo, m.message_id, False)
+        await svc.audit(who(m), "expense_add", "expense", eid, "", f"{clean} — {amt}", "topic")
+        need_id = ""                                      # заявка привязывается к первой строке
+    await react(m, "✅")
+
+
 async def ask_amount_later(m: Message):
     """Фото без суммы: ждём секунду — в альбоме подпись может быть на другом фото."""
     await asyncio.sleep(2 if m.media_group_id else 0)
@@ -356,10 +377,24 @@ async def ask_amount_later(m: Message):
 
 @router.edited_message(F.func(is_spent_topic))
 async def spent_edited(m: Message):
-    found = await run(sheets.get().expense_by_msg, m.message_id)
-    if not found:
+    rows = await run(sheets.get().expenses_by_msg, m.message_id)
+    if not rows:
         return
     text = (m.text or m.caption or "").strip() or "чек"
+    items = split_expense_lines(text)
+    if len(rows) > 1 or items:                           # было или стало несколько строк — пересобираем
+        for r_idx, r_rec in rows:
+            await svc.expense_mark_deleted(r_idx, r_rec, who(m), "topic")
+        photo = str(rows[0][1].get("photo", ""))
+        if items:
+            await add_expense_lines(m, items, photo)
+        else:
+            amt = parse_amount(text)
+            eid = await run(sheets.get().expense_add, who(m), amt, text, exp_category(text), "", photo, m.message_id, False)
+            await svc.audit(who(m), "expense_add", "expense", eid, "", f"{text} — {amt if amt is not None else '?'}", "topic")
+            await react(m, "✅" if amt is not None else "❓")
+        return
+    found = rows[0]
     amt = parse_amount(text)
     await svc.expense_amend(found[0], found[1], who(m), "topic", text=text, amount=amt if amt is not None else "")
     await react(m, "✅" if amt is not None else "❓")
@@ -369,10 +404,11 @@ async def spent_edited(m: Message):
 async def cmd_del(m: Message):
     if not m.reply_to_message:
         return await m.reply("Ответь /del на запись, которую убрать.")
-    found = await run(sheets.get().expense_by_msg, m.reply_to_message.message_id)
-    if not found:
+    rows = await run(sheets.get().expenses_by_msg, m.reply_to_message.message_id)
+    if not rows:
         return await m.reply("Это не запись расхода.")
-    await svc.expense_mark_deleted(found[0], found[1], who(m), "topic")
+    for r_idx, r_rec in rows:
+        await svc.expense_mark_deleted(r_idx, r_rec, who(m), "topic")
     await react(m.reply_to_message, "👌")
 
 
